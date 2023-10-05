@@ -14,13 +14,6 @@ from .resolver import Resolver
 from .server import Server
 from .utils import IPPortPatternLine, log
 
-# Pause between grabbing cycles; in seconds.
-GRAB_PAUSE = 180
-
-# The maximum number of providers that are parsed concurrently
-MAX_CONCURRENT_PROVIDERS = 3
-
-
 class Broker:
     """The Broker.
 
@@ -39,6 +32,10 @@ class Broker:
     :param list providers:
         (optional) Urls of pages where to find proxies.
         Or :class:`~proxybroker.providers.Provider` objects
+    :param int max_concurrent_providers:
+        (optional) The maximum number of providers that are parsed concurrently.
+    :param int grab_pause:
+        (optional) Pause between grabbing cycles; in seconds.
     :param bool verify_ssl:
         (optional) Flag indicating whether to check the SSL certificates.
         Set to True to check ssl certifications
@@ -59,7 +56,9 @@ class Broker:
         max_tries=3,
         judges=None,
         providers=None,
+        max_concurrent_providers=3,
         verify_ssl=False,
+        grab_pause=180,
         loop=None,
         stop_broker_on_sigint=True,
         **kwargs,
@@ -104,6 +103,8 @@ class Broker:
             p if isinstance(p, Provider) else Provider(p)
             for p in (providers or PROVIDERS)
         ]
+        self._max_concurrent_providers = max_concurrent_providers
+        self._grab_pause = grab_pause
         if stop_broker_on_sigint:
             try:
                 self._loop.add_signal_handler(signal.SIGINT, self.stop)
@@ -315,7 +316,7 @@ class Broker:
         self._done()
 
     async def _grab(self, types=None, check=False):
-        def _get_tasks(by=MAX_CONCURRENT_PROVIDERS):
+        def _get_tasks(by=self._max_concurrent_providers):
             providers = [
                 pr
                 for pr in self._providers
@@ -338,8 +339,8 @@ class Broker:
                         await self._handle(proxy, check=check)
             log.debug('Grab cycle is complete')
             if self._server:
-                log.debug('fall asleep for %d seconds' % GRAB_PAUSE)
-                await asyncio.sleep(GRAB_PAUSE)
+                log.debug('fall asleep for %d seconds' % self._grab_pause)
+                await asyncio.sleep(self._grab_pause)
                 log.debug('awaked')
             else:
                 break
