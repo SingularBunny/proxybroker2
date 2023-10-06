@@ -299,7 +299,7 @@ class Proxy:
                 sock = self._writer['conn'].get_extra_info('socket')
                 params = {
                     'ssl': self._ssl_context,
-                    'sock': sock,
+                    'sock': sock.dup(),
                     'server_hostname': self.host,
                 }
             else:
