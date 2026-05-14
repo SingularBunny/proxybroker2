@@ -226,16 +226,48 @@ class TestProxyPoolPublicContract:
 
     @pytest.mark.asyncio
     async def test_proxy_pool_get_signature(self):
-        """Test ProxyPool.get() signature remains stable."""
+        """Test ProxyPool.get() signature remains stable.
+
+        ``timeout`` was added as a keyword-only parameter (non-breaking).
+        """
         proxies = asyncio.Queue()
         pool = ProxyPool(proxies)
         sig = inspect.signature(pool.get)
 
-        expected_params = {"scheme"}
+        # ``timeout`` is keyword-only so existing callers are unaffected.
+        expected_params = {"scheme", "timeout"}
         actual_params = set(sig.parameters.keys())
         assert expected_params == actual_params
 
+        # ``timeout`` must be keyword-only to avoid breaking positional callers.
+        assert sig.parameters["timeout"].kind == inspect.Parameter.KEYWORD_ONLY
+        assert sig.parameters["timeout"].default is None  # default: use pool's import_timeout
+
         assert asyncio.iscoroutinefunction(pool.get)
+
+    @pytest.mark.asyncio
+    async def test_proxy_pool_acquire_is_async_context_manager(self):
+        """Test that ProxyPool.acquire() exists and is an async context manager."""
+        import asyncio
+
+        proxies = asyncio.Queue()
+        pool = ProxyPool(proxies)
+
+        # acquire() should be callable and return an async context manager
+        assert callable(pool.acquire)
+
+    @pytest.mark.asyncio
+    async def test_proxy_pool_get_any_signature(self):
+        """Test ProxyPool.get_any() exists with the expected signature."""
+        proxies = asyncio.Queue()
+        pool = ProxyPool(proxies)
+        sig = inspect.signature(pool.get_any)
+
+        expected_params = {"schemes", "timeout"}
+        actual_params = set(sig.parameters.keys())
+        assert expected_params == actual_params
+
+        assert asyncio.iscoroutinefunction(pool.get_any)
 
     def test_proxy_pool_put_signature(self):
         """Test ProxyPool.put() signature remains stable."""

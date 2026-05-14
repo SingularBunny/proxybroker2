@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import heapq
 import time
 
@@ -56,10 +57,21 @@ class ProxyPool:
         if strategy != "best":
             raise ValueError("`strategy` only support `best` for now.")
 
-    async def get(self, scheme):
+    async def get(self, scheme, *, timeout: float | None = None):
+        """Return a proxy that supports *scheme* (``'HTTP'`` or ``'HTTPS'``).
+
+        :param scheme: Required proxy scheme – ``'HTTP'`` or ``'HTTPS'``.
+        :param timeout: How many seconds to wait for a matching proxy to
+            appear in the broker queue.  ``None`` (default) uses the pool's
+            *import_timeout* constructor argument.  Pass ``0`` to raise
+            :exc:`~proxybroker.errors.NoProxyError` immediately when the
+            queue is empty.
+        :raises NoProxyError: When no matching proxy can be obtained within
+            *timeout* seconds.
+        """
         scheme = scheme.upper()
         if len(self._pool) + len(self._newcomers) < self._min_queue:
-            chosen = await self._import(scheme)
+            chosen = await self._import(scheme, timeout=timeout)
         elif len(self._newcomers) > 0:
             chosen = self._newcomers.pop(0)
         elif self._strategy == "best":
@@ -81,17 +93,71 @@ class ProxyPool:
                 # Put back all items if we didn't find a suitable proxy
                 for item in temp_items:
                     heapq.heappush(self._pool, item)
-                chosen = await self._import(scheme)
+                chosen = await self._import(scheme, timeout=timeout)
 
         return chosen
 
-    async def _import(self, expected_scheme):
+    @contextlib.asynccontextmanager
+    async def acquire(self, scheme, *, timeout: float | None = None):
+        """Async context manager that acquires a proxy and returns it to the
+        pool on exit – even if an exception is raised inside the block.
+
+        Usage::
+
+            async with pool.acquire('HTTP', timeout=5) as proxy:
+                proxy_url = f"http://{proxy.host}:{proxy.port}"
+                # ... use proxy_url for requests ...
+
+        :param scheme: Required proxy scheme – ``'HTTP'`` or ``'HTTPS'``.
+        :param timeout: Forwarded to :meth:`get`.
+        :raises NoProxyError: When no matching proxy can be obtained.
+        """
+        proxy = await self.get(scheme, timeout=timeout)
+        try:
+            yield proxy
+        finally:
+            self.put(proxy)
+
+    async def get_any(
+        self,
+        schemes: tuple[str, ...] = ("HTTP", "HTTPS"),
+        *,
+        timeout: float | None = None,
+    ):
+        """Return the first available proxy that supports any of *schemes*.
+
+        Schemes are tried in order; the first successful :meth:`get` wins.
+        This is useful when the destination URL is HTTPS but plain HTTP
+        proxies (which support ``CONNECT`` tunnelling) are also acceptable.
+
+        Usage::
+
+            proxy = await pool.get_any(('HTTP', 'HTTPS'), timeout=5)
+
+        :param schemes: Iterable of scheme strings to try, in priority order.
+            Defaults to ``('HTTP', 'HTTPS')``.
+        :param timeout: Per-scheme timeout forwarded to :meth:`get`.
+        :raises NoProxyError: When no proxy is available for *any* of the
+            requested schemes.
+        """
+        last_exc: NoProxyError | None = None
+        for scheme in schemes:
+            try:
+                return await self.get(scheme, timeout=timeout)
+            except NoProxyError as exc:
+                last_exc = exc
+        raise NoProxyError(
+            f"No proxy available for any of the schemes: {list(schemes)}"
+        ) from last_exc
+
+    async def _import(self, expected_scheme, *, timeout: float | None = None):
+        import_timeout = timeout if timeout is not None else self._import_timeout
         retry_count = 0
 
         while retry_count < self._max_import_retries:
             try:
                 proxy = await asyncio.wait_for(
-                    self._proxies.get(), timeout=self._import_timeout
+                    self._proxies.get(), timeout=import_timeout
                 )
                 self._proxies.task_done()
 
