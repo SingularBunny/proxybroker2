@@ -114,7 +114,6 @@ class Judge:
 
 def get_judges(judges=None, timeout=8, verify_ssl=False):
     judges = judges or [
-        "http://httpbin.org/get?show_env",
         "https://httpbin.org/get?show_env",
         "smtp://smtp.gmail.com",
         "smtp://aspmx.l.google.com",
