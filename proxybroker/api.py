@@ -45,6 +45,13 @@ class Broker:
     :param loop: (optional) asyncio compatible event loop
     :param stop_broker_on_sigint: (optional) whether set SIGINT signal on broker object.
         Useful for a thread other than main thread.
+    :param list ip_hosts:
+        (optional) URLs used to detect this machine's external IP address.
+        Each URL must return either a plain-text IP or a JSON object with an
+        ``origin``, ``ip``, or ``query`` field (httpbin-compatible).
+        Defaults to :attr:`Resolver._ip_hosts`.
+        Set this to the same host(s) used as judges to guarantee IP consistency
+        on multi-homed machines where different services may see different IPs.
 
     .. deprecated:: 0.2.0
         Use :attr:`max_conn` and :attr:`max_tries` instead of
@@ -62,6 +69,7 @@ class Broker:
         verify_ssl=False,
         loop=None,
         stop_broker_on_sigint=True,
+        ip_hosts=None,
         **kwargs,
     ):
         try:
@@ -70,7 +78,7 @@ class Broker:
             # No running event loop, will be set later
             self._loop = loop
         self._proxies = queue or asyncio.Queue()
-        self._resolver = Resolver(loop=self._loop)
+        self._resolver = Resolver(loop=self._loop, ip_hosts=ip_hosts)
         self._timeout = timeout
         self._verify_ssl = verify_ssl
 

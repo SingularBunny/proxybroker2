@@ -42,6 +42,7 @@ class TestBrokerPublicContract:
             "verify_ssl",
             "loop",
             "stop_broker_on_sigint",
+            "ip_hosts",
             "kwargs",
         }
         actual_params = set(sig.parameters.keys())

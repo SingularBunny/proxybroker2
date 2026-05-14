@@ -33,13 +33,12 @@ class Resolver:
         "http://ipinfo.io/ip",
         "http://ipv4.icanhazip.com/",
         "http://myexternalip.com/raw",
-        "http://ipinfo.io/ip",
         "http://ifconfig.io/ip",
     ]
     # the list of resolvers will point a copy of original one
     _temp_host = []
 
-    def __init__(self, timeout=5, loop=None):
+    def __init__(self, timeout=5, loop=None, ip_hosts=None):
         self._timeout = timeout
         try:
             self._loop = loop or asyncio.get_running_loop()
@@ -47,6 +46,8 @@ class Resolver:
             # No running event loop, will be set later
             self._loop = loop
         self._resolver = aiodns.DNSResolver()
+        if ip_hosts is not None:
+            self._ip_hosts = list(ip_hosts)
 
     @staticmethod
     def host_is_ip(host):
@@ -97,7 +98,13 @@ class Resolver:
         return host
 
     async def get_real_ext_ip(self):
-        """Return real external IP address."""
+        """Return real external IP address.
+
+        Supports both plain-text IP responses (e.g. api.ipify.org) and
+        JSON responses with an ``origin``, ``ip``, or ``query`` field
+        (e.g. httpbin.org/get?show_env).  When multiple IPs are returned
+        as a comma-separated list only the first one is used.
+        """
         # make a copy of original one to temp one
         # so original one will stay no change
         self._temp_host = self._ip_hosts.copy()
@@ -108,7 +115,18 @@ class Resolver:
                     aiohttp.ClientSession(timeout=timeout) as session,
                     session.get(self._pop_random_ip_host()) as resp,
                 ):
-                    ip = await resp.text()
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "json" in content_type:
+                        data = await resp.json(content_type=None)
+                        raw = (
+                            data.get("origin")
+                            or data.get("ip")
+                            or data.get("query")
+                            or ""
+                        )
+                        ip = raw.split(",")[0].strip()
+                    else:
+                        ip = await resp.text()
             except asyncio.TimeoutError:
                 log.debug("Timeout getting external IP from service, trying next...")
             else:
