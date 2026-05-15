@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolver test exception handling with proper asyncio.TimeoutError usage
 - Broad exception handling in tests replaced with specific exception types
 - Code formatting consistency across all test files
+- **Critical**: Concurrent broker race condition — `Checker.__init__` called
+  `Judge.clear()` on every construction, wiping the class-level singleton
+  `Judge.available` and `Judge.ev` while another broker's proxy checks were
+  in-flight. Proxies that resumed after the clear hit `random.choice([])` →
+  `IndexError`, or found HTTP checking disabled, resulting in 0 proxies
+  collected when two `Broker` instances ran simultaneously. Fix: removed
+  `Judge.clear()` from `Checker.__init__`; callers must call `Judge.clear()`
+  once before starting any brokers (this is already the documented pattern).
+- **Critical**: `Judge.clear()` reused existing `asyncio.Event` objects via
+  `.clear()`, causing `RuntimeError: bound to a different event loop` when
+  `Judge.clear()` was called across multiple `asyncio.run()` invocations.
+  Fix: `Judge.clear()` now recreates `Event` objects instead of resetting them.
 
 ### Changed
 - Pre-commit configuration updated to ignore false positive security warnings for test files

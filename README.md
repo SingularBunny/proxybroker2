@@ -260,6 +260,43 @@ if __name__ == "__main__":
 
 [More examples](https://proxybroker2.readthedocs.io/en/latest/examples.html).
 
+### Running multiple brokers concurrently
+
+When you need separate proxy pools (e.g. one with country filtering, one without),
+you can run multiple `Broker` instances in the same event loop. Call `Judge.clear()`
+**once** before starting any broker — not per-broker:
+
+```python
+import asyncio
+from proxybroker import Broker
+from proxybroker.judge import Judge
+
+async def main():
+    ru_proxies  = asyncio.Queue()
+    any_proxies = asyncio.Queue()
+
+    broker_ru  = Broker(ru_proxies)
+    broker_any = Broker(any_proxies)
+
+    # Clear judge state once before starting any broker.
+    # Do NOT call Judge.clear() again after this point — it would wipe
+    # verified judges from the other running broker mid-flight.
+    Judge.clear()
+
+    await asyncio.gather(
+        broker_ru.find(types=["HTTP", "HTTPS"], countries=["RU"]),
+        broker_any.find(types=["HTTP", "HTTPS"]),
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+> **Note:** `Judge.available` and `Judge.ev` are class-level singletons shared
+> across all `Broker`/`Checker` instances. Both brokers share the same verified
+> judge pool, which is fine — more verified judges means more reliable proxy
+> checking. The important rule is to call `Judge.clear()` only once, at startup.
+
 ### 🔬 **Testing Philosophy**
 
 ProxyBroker2 implements a comprehensive **contract-based testing strategy** that ensures reliability while enabling innovation:

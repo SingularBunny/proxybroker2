@@ -35,7 +35,9 @@ class Checker:
         post=False,
         loop=None,
     ):
-        Judge.clear()
+        # Judge.clear() removed: it wiped verified judges from other concurrently
+        # running brokers (class-level singleton race). Callers must call
+        # Judge.clear() once before starting any brokers.
         self._judges = get_judges(judges, timeout, verify_ssl)
         self._method = "POST" if post else "GET"
         self._max_tries = max_tries

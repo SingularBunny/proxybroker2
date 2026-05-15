@@ -55,9 +55,12 @@ class Judge:
         cls.available["HTTP"].clear()
         cls.available["HTTPS"].clear()
         cls.available["SMTP"].clear()
-        cls.ev["HTTP"].clear()
-        cls.ev["HTTPS"].clear()
-        cls.ev["SMTP"].clear()
+        # Recreate Event objects rather than calling .clear() on them.
+        # asyncio.Event binds to the running loop on first use; reusing an Event
+        # across multiple asyncio.run() calls raises "bound to a different event loop".
+        cls.ev["HTTP"] = asyncio.Event()
+        cls.ev["HTTPS"] = asyncio.Event()
+        cls.ev["SMTP"] = asyncio.Event()
 
     async def check(self, real_ext_ip):
         # TODO: need refactoring
