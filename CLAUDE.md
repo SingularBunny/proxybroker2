@@ -182,6 +182,22 @@ docs/source/
 - Entry points: `__main__.py` (module), `py2exe_entrypoint.py` (executable)
 - ProxyPool.remove() is O(N log N) - acceptable for correctness
 
+### Proxy validation quirks
+
+**Split routing / transparent caching proxy:** On machines where HTTP traffic exits via a
+different IP depending on request headers, `get_real_ext_ip()` and judge checks must use
+identical headers — otherwise judges see a different IP than `real_ext_ip` and all validation
+fails. Fixed in `resolver.py`: `get_real_ext_ip()` passes `get_headers()` (cache-bypass
+headers) to match what judge checks send. See `docs/source/troubleshooting.md`.
+
+**`proxy.types` vs `proxy.schemes`:** `proxy.schemes` returns a `tuple` like `("HTTP", "HTTPS")`
+representing TCP-level capability — not the proxy protocol. Actual proxy type (SOCKS5, SOCKS4,
+HTTPS) is in `proxy.types` dict. Always use `"SOCKS5" in proxy.types`, never `proxy.schemes & set`.
+
+**Broken HTTPS judge URL:** `https://httpbin.org/get?show_env` returns 502. Use
+`https://httpbin.org/get` (no query string) — returns JSON with `origin` IP and all request
+headers including User-Agent with `rv` value, satisfying both judge validation conditions.
+
 ## Recent Major Improvements (v2.0.0b1 - Released May 26, 2025)
 
 ### Production-Ready Status

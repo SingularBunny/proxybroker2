@@ -171,6 +171,7 @@ Contents:
    api
    api_auto
    examples
+   troubleshooting
    changelog.md
 
 
