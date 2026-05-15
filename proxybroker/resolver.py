@@ -10,7 +10,7 @@ import aiohttp
 import maxminddb
 
 from .errors import ResolveError
-from .utils import DATA_DIR, log
+from .utils import DATA_DIR, get_headers, log
 
 GeoData = namedtuple(
     "GeoData", ["code", "name", "region_code", "region_name", "city_name"]
@@ -105,15 +105,19 @@ class Resolver:
         (e.g. httpbin.org/get?show_env).  When multiple IPs are returned
         as a comma-separated list only the first one is used.
         """
-        # make a copy of original one to temp one
-        # so original one will stay no change
+        # Use the same headers that proxybroker sends to judges so that
+        # real_ext_ip is detected via the same network path. On hosts with
+        # split routing (e.g. a transparent caching proxy), plain requests
+        # and cache-bypassing requests may exit through different IPs; judges
+        # always use these headers, so ip detection must too.
+        _ip_headers = get_headers()
         self._temp_host = self._ip_hosts.copy()
         while self._temp_host:
             try:
                 timeout = aiohttp.ClientTimeout(total=self._timeout)
                 async with (
                     aiohttp.ClientSession(timeout=timeout) as session,
-                    session.get(self._pop_random_ip_host()) as resp,
+                    session.get(self._pop_random_ip_host(), headers=_ip_headers) as resp,
                 ):
                     content_type = resp.headers.get("Content-Type", "")
                     if "json" in content_type:
