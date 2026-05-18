@@ -1,4 +1,5 @@
 import asyncio
+import ssl
 import time
 import warnings
 import zlib
@@ -34,7 +35,20 @@ class Checker:
         types=None,
         post=False,
         loop=None,
+        verify_url=None,
+        verify_timeout=10,
+        verify_ok_statuses=None,
     ):
+        """
+        :param str verify_url: (optional) URL to test each proxy against after
+            judge-based validation.  Only proxies that receive a response with a
+            status code in *verify_ok_statuses* are kept.  Useful to pre-filter
+            proxies blocked by a specific site's WAF (e.g. ``https://www.cian.ru/``).
+        :param float verify_timeout: Timeout in seconds for the *verify_url* request
+            (default: 10).
+        :param set verify_ok_statuses: HTTP status codes considered "passing"
+            (default: all 1xx–3xx, i.e. ``< 400``).
+        """
         # Judge.clear() removed: it wiped verified judges from other concurrently
         # running brokers (class-level singleton race). Callers must call
         # Judge.clear() once before starting any brokers.
@@ -45,6 +59,9 @@ class Checker:
         self._strict = strict
         self._dnsbl = dnsbl or []
         self._types = types or {}
+        self._verify_url = verify_url
+        self._verify_timeout = verify_timeout
+        self._verify_ok_statuses = verify_ok_statuses
         try:
             self._loop = loop or asyncio.get_running_loop()
         except RuntimeError:
@@ -136,6 +153,60 @@ class Checker:
             return True
         return False
 
+    async def _verify_against_url(self, proxy) -> bool:
+        """Test proxy against *verify_url* using aiohttp.
+
+        Returns True if the response status is in *verify_ok_statuses*
+        (default: any status < 400).  Connection errors and timeouts return False.
+        """
+        try:
+            import aiohttp
+            from aiohttp_socks import ProxyConnector
+        except ImportError:
+            log.warning("aiohttp / aiohttp_socks not installed; skipping verify_url check")
+            return True
+
+        is_socks5 = "SOCKS5" in proxy.types
+        is_socks4 = "SOCKS4" in proxy.types
+        ok_statuses = self._verify_ok_statuses
+
+        _ssl_ctx = ssl.create_default_context()
+        _ssl_ctx.check_hostname = False
+        _ssl_ctx.verify_mode = ssl.CERT_NONE
+        timeout = aiohttp.ClientTimeout(total=self._verify_timeout)
+
+        try:
+            if is_socks5 or is_socks4:
+                proto = "socks5" if is_socks5 else "socks4"
+                connector = ProxyConnector.from_url(
+                    f"{proto}://{proxy.host}:{proxy.port}", ssl=_ssl_ctx
+                )
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.get(
+                        self._verify_url, allow_redirects=False, ssl=_ssl_ctx
+                    ) as resp:
+                        status = resp.status
+            else:
+                # HTTP proxy
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        self._verify_url,
+                        proxy=f"http://{proxy.host}:{proxy.port}",
+                        allow_redirects=False,
+                        ssl=_ssl_ctx,
+                    ) as resp:
+                        status = resp.status
+
+            passed = (status < 400) if ok_statuses is None else (status in ok_statuses)
+            proxy.log(
+                f"[INFO]: verify_url={self._verify_url} status={status} "
+                f"({'OK' if passed else 'BLOCKED'})"
+            )
+            return passed
+        except Exception as e:
+            proxy.log(f"[INFO]: verify_url={self._verify_url} error: {e}")
+            return False
+
     async def check(self, proxy):
         if self._dnsbl:
             if await self._in_DNSBL(proxy.host):
@@ -165,6 +236,8 @@ class Checker:
         proxy.is_working = True if any(results) else False
 
         if proxy.is_working and self._types_passed(proxy):
+            if self._verify_url:
+                return await self._verify_against_url(proxy)
             return True
         return False
 

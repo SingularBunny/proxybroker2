@@ -28,6 +28,7 @@ Features
 -   Finds more than 7000 working proxies from \~50 sources.
 -   Support protocols: HTTP(S), SOCKS4/5. Also CONNECT method to ports 80 and 23 (SMTP).
 -   Proxies may be filtered by type, anonymity level, response time, country and status in DNSBL.
+-   **Site-level verification**: optionally test each proxy against a specific target URL (e.g. ``https://www.cian.ru/``) and discard proxies blocked by the site's WAF before they enter the pool.
 -   Work as a proxy server that distributes incoming requests to external proxies. With automatic proxy rotation.
 -   All proxies are checked to support Cookies and Referer (and POST requests if required).
 -   Automatically removes duplicate proxies.
@@ -296,6 +297,47 @@ if __name__ == "__main__":
 > across all `Broker`/`Checker` instances. Both brokers share the same verified
 > judge pool, which is fine — more verified judges means more reliable proxy
 > checking. The important rule is to call `Judge.clear()` only once, at startup.
+
+### Site-level verification (WAF filtering)
+
+Many target sites block datacenter IPs at the WAF level even if those proxies
+pass the anonymity judge. Use `verify_url` to pre-filter such proxies:
+
+```python
+import asyncio
+from proxybroker import Broker
+
+async def show(proxies):
+    while True:
+        proxy = await proxies.get()
+        if proxy is None:
+            break
+        # Every proxy here has already been verified against cian.ru
+        print("Working proxy: %s" % proxy)
+
+async def main():
+    proxies = asyncio.Queue()
+    broker = Broker(
+        proxies,
+        # After the anonymity judge passes, each proxy is tested against
+        # this URL. Proxies that receive HTTP 4xx/5xx or time out are
+        # discarded before entering the queue.
+        verify_url="https://www.cian.ru/",
+        verify_timeout=10,          # seconds (default: 10)
+        # verify_ok_statuses={200, 301, 302},  # default: any status < 400
+    )
+    await asyncio.gather(
+        broker.find(types=["HTTPS", "SOCKS4", "SOCKS5"], limit=20),
+        show(proxies),
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+`verify_url` requires `aiohttp` and `aiohttp-socks` to be installed (both are
+already dependencies of proxybroker2).
+
 
 ### 🔬 **Testing Philosophy**
 

@@ -70,6 +70,9 @@ class Broker:
         loop=None,
         stop_broker_on_sigint=True,
         ip_hosts=None,
+        verify_url=None,
+        verify_timeout=10,
+        verify_ok_statuses=None,
         **kwargs,
     ):
         try:
@@ -81,6 +84,9 @@ class Broker:
         self._resolver = Resolver(loop=self._loop, ip_hosts=ip_hosts)
         self._timeout = timeout
         self._verify_ssl = verify_ssl
+        self._verify_url = verify_url
+        self._verify_timeout = verify_timeout
+        self._verify_ok_statuses = verify_ok_statuses
 
         self.unique_proxies = {}
         self._all_tasks = []
@@ -181,6 +187,18 @@ class Broker:
             (optional) Spam databases for proxy checking.
             `Wiki <https://en.wikipedia.org/wiki/DNSBL>`_
         :param int limit: (optional) The maximum number of proxies
+        :param str verify_url:
+            (optional) URL to test each proxy against after judge validation.
+            Proxies that receive a response with status >= 400 or that time out
+            are discarded.  Use this to pre-filter proxies blocked by a specific
+            site's WAF (e.g. ``"https://www.cian.ru/"``).
+            Requires ``aiohttp`` and ``aiohttp-socks`` to be installed.
+        :param float verify_timeout:
+            (optional) Timeout in seconds for the *verify_url* request
+            (default: 10).
+        :param set verify_ok_statuses:
+            (optional) Set of HTTP status codes considered "passing".
+            Defaults to any status < 400 (i.e. 1xx, 2xx, 3xx).
 
         :raises ValueError:
             If :attr:`types` not given.
@@ -206,6 +224,9 @@ class Broker:
             strict=strict,
             dnsbl=dnsbl,
             loop=self._loop,
+            verify_url=self._verify_url,
+            verify_timeout=self._verify_timeout,
+            verify_ok_statuses=self._verify_ok_statuses,
         )
         self._countries = countries
         self._limit = limit
