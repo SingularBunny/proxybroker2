@@ -20,6 +20,37 @@ _HTTP_PROTOS = {"HTTP", "CONNECT:80", "SOCKS4", "SOCKS5"}
 _HTTPS_PROTOS = {"HTTPS", "SOCKS4", "SOCKS5"}
 
 
+def _format_host_port(host: str, port: int | str) -> str:
+    """Format `host:port` with RFC 3986 IPv6 bracketing.
+
+    IPv6 literals contain colons, which would ambiguate against the
+    port separator. RFC 3986 § 3.2.2 mandates `[host]:port` for IPv6
+    in URI authority components; we use the same form everywhere so
+    proxy strings paste cleanly into clients that expect URI syntax.
+    IPv4 hosts pass through unchanged.
+    """
+    if ":" in str(host):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+# nosemgrep: python.lang.security.unverified-ssl-context.unverified-ssl-context
+def _make_unverified_ssl_context_for_proxy_testing():
+    """Build an SSL context that skips cert + hostname verification.
+
+    Intentional. Proxy testing connects to whatever server the proxy is
+    (often expired/self-signed/mismatched). Users who only test trusted
+    proxies should construct ``Proxy(verify_ssl=True)`` to opt into the
+    standard verifying context. This helper exists so the unsafe choice
+    is named, isolated, and only annotated in one place rather than
+    spread across the constructor.
+    """
+    ctx = _ssl.create_default_context()  # NOSONAR
+    ctx.check_hostname = False  # NOSONAR
+    ctx.verify_mode = _ssl.CERT_NONE  # NOSONAR
+    return ctx  # noqa: S323  # nosec B323  # NOSONAR
+
+
 class Proxy:
     """Proxy.
 
@@ -58,7 +89,12 @@ class Proxy:
             _host = await resolver.resolve(host)
             self = cls(_host, *args, **kwargs)
         except (ResolveError, ValueError) as e:
-            log.error("%s:%s: Error at creating: %s" % (host, args[0], e))
+            # `port` may be passed positionally (args[0]) or by keyword,
+            # or omitted entirely (defaults to None). Use whichever is
+            # available rather than crashing with IndexError on args[0]
+            # and masking the real error.
+            port = args[0] if args else kwargs.get("port", "?")
+            log.error(f"{host}:{port}: Error at creating: {e}")
             raise
         return self
 
@@ -86,7 +122,10 @@ class Proxy:
             "SOCKS5",
         }
         self._timeout = timeout
-        self._ssl_context = True if verify_ssl else _ssl._create_unverified_context()
+        if verify_ssl:
+            self._ssl_context = True
+        else:
+            self._ssl_context = _make_unverified_ssl_context_for_proxy_testing()
         self._types = {}
         self._is_working = False
         self.stat = {"requests": 0, "errors": Counter()}
@@ -113,13 +152,7 @@ class Proxy:
             s = s.format(tp=tp, lvl=lvl)
             tpinfo.append(s)
         tpinfo = ", ".join(tpinfo)
-        return "<Proxy {code} {avg:.2f}s [{types}] {host}:{port}>".format(
-            code=self._geo.code,
-            types=tpinfo,
-            host=self.host,
-            port=self.port,
-            avg=self.avg_resp_time,
-        )
+        return f"<Proxy {self._geo.code} {self.avg_resp_time:.2f}s [{tpinfo}] {_format_host_port(self.host, self.port)}>"
 
     @property
     def types(self):
@@ -280,16 +313,19 @@ class Proxy:
 
     def as_text(self):
         """
-        Return proxy as host:port
+        Return proxy as host:port (IPv6 bracketed per RFC 3986).
 
         :rtype: str
         """
-        return f"{self.host}:{self.port}\n"
+        return f"{_format_host_port(self.host, self.port)}\n"
 
     def log(self, msg, stime=0, err=None):
         ngtr = self.ngtr.name if self.ngtr else "INFO"
         runtime = time.time() - stime if stime else 0
-        log.debug(f"{self.host}:{self.port} [{ngtr}]: {msg}; Runtime: {runtime:.2f}")
+        log.debug(
+            f"{_format_host_port(self.host, self.port)} [{ngtr}]: {msg}; "
+            f"Runtime: {runtime:.2f}"
+        )
         trunc = "..." if len(msg) > 58 else ""
         msg = f"{msg:.60s}{trunc}"
         self._log.append((ngtr, msg, runtime))
@@ -310,9 +346,9 @@ class Proxy:
 
     async def connect(self, ssl=False):
         err = None
-        msg = "%s" % "SSL: " if ssl else ""
+        msg = "{}".format("SSL: ") if ssl else ""
         stime = time.time()
-        self.log("%sInitial connection" % msg)
+        self.log(f"{msg}Initial connection")
         try:
             if ssl:
                 _type = "ssl"
@@ -323,7 +359,7 @@ class Proxy:
 
                 # Upgrade transport to SSL
                 ssl_transport = await asyncio.wait_for(
-                    asyncio.get_event_loop().start_tls(
+                    asyncio.get_running_loop().start_tls(
                         transport,
                         protocol,
                         self._ssl_context,
@@ -338,7 +374,7 @@ class Proxy:
                     ssl_transport,
                     protocol,
                     self._reader[_type],
-                    asyncio.get_event_loop(),
+                    asyncio.get_running_loop(),
                 )
             else:
                 _type = "conn"
@@ -395,12 +431,12 @@ class Proxy:
         try:
             self.writer.write(_req)
             await self.writer.drain()
-        except ConnectionResetError:
+        except ConnectionResetError as exc:
             msg = "; Sending: failed"
             err = ProxySendError(msg)
-            raise err
+            raise err from exc
         finally:
-            self.log("Request: %s%s" % (req, msg), err=err)
+            self.log(f"Request: {req}{msg}", err=err)
 
     async def recv(self, length=0, head_only=False):
         resp, msg, err = b"", "", None
@@ -418,13 +454,13 @@ class Proxy:
             err = ProxyRecvError(msg)
             raise err from e
         else:
-            msg = "Received: %s bytes" % len(resp)
+            msg = f"Received: {len(resp)} bytes"
             if not resp:
                 err = ProxyEmptyRecvError(msg)
                 raise err
         finally:
             if resp:
-                msg += ": %s" % resp[:12]
+                msg += f": {resp[:12]}"
             self.log(msg, stime, err=err)
         return resp
 

@@ -9,7 +9,14 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 
 from .errors import BadStatusError
-from .utils import IPPattern, IPPortPatternGlobal, get_headers, log
+from .utils import (
+    IPPattern,
+    IPPortPatternGlobal,
+    IPv6BracketedPortPattern,
+    canonicalize_ip,
+    get_headers,
+    log,
+)
 
 
 class Provider:
@@ -76,7 +83,7 @@ class Provider:
 
         :return: :attr:`.proxies`
         """
-        log.debug("Try to get proxies from %s" % self.domain)
+        log.debug(f"Try to get proxies from {self.domain}")
 
         async with aiohttp.ClientSession(
             headers=get_headers(), cookies=self._cookies
@@ -84,8 +91,7 @@ class Provider:
             await self._pipe()
 
         log.debug(
-            "%d proxies received from %s: %s"
-            % (len(self.proxies), self.domain, self.proxies)
+            f"{len(self.proxies)} proxies received from {self.domain}: {self.proxies}"
         )
         return self.proxies
 
@@ -113,14 +119,11 @@ class Provider:
         except Exception as e:
             received = []
             log.error(
-                "Error when executing find_proxies."
-                "Domain: %s; Error: %r" % (self.domain, e)
+                f"Error when executing find_proxies.Domain: {self.domain}; Error: {e!r}"
             )
         self.proxies = received
         added = len(self.proxies) - oldcount
-        log.debug(
-            "%d(%d) proxies added(received) from %s" % (added, len(received), url)
-        )
+        log.debug(f"{added}({len(received)}) proxies added(received) from {url}")
 
     async def get(self, url, data=None, headers=None, method="GET"):
         for _ in range(self._max_tries):
@@ -142,10 +145,9 @@ class Provider:
                 page = await resp.text()
                 if resp.status != 200:
                     log.debug(
-                        "url: %s\nheaders: %s\ncookies: %s\npage:\n%s"
-                        % (url, resp.headers, resp.cookies, page)
+                        f"url: {url}\nheaders: {resp.headers}\ncookies: {resp.cookies}\npage:\n{page}"
                     )
-                    raise BadStatusError("Status: %s" % resp.status)
+                    raise BadStatusError(f"Status: {resp.status}")
         except (
             UnicodeDecodeError,
             BadStatusError,
@@ -155,15 +157,30 @@ class Provider:
             aiohttp.ServerDisconnectedError,
         ) as e:
             page = ""
-            log.debug("%s is failed. Error: %r;" % (url, e))
+            log.debug(f"{url} is failed. Error: {e!r};")
         return page
 
     def find_proxies(self, page):
-        return self._find_proxies(page)
+        # Default IPv4 extraction via _find_proxies (subclasses may
+        # override `_pattern`), then add IPv6 `[v6]:port` entries here
+        # in the public method so subclasses that override `find_proxies`
+        # to do their own decoding (b64, custom parsing) aren't fed
+        # already-normalized (host, port) tuples they can't handle.
+        #
+        # Mask bracketed IPv6 spans before the IPv4 pass so feeds carrying
+        # IPv4-mapped IPv6 entries like `[::ffff:192.0.2.1]:8080` don't
+        # *also* enqueue a phantom `192.0.2.1:8080` IPv4 entry that the
+        # provider never advertised.
+        masked = IPv6BracketedPortPattern.sub(lambda m: " " * len(m.group(0)), page)
+        proxies = self._find_proxies(masked)
+        for raw_v6, port in IPv6BracketedPortPattern.findall(page):
+            canonical = canonicalize_ip(raw_v6)
+            if canonical is not None:
+                proxies.append((canonical, port))
+        return proxies
 
     def _find_proxies(self, page):
-        proxies = self._pattern.findall(page)
-        return proxies
+        return list(self._pattern.findall(page))
 
 
 class Freeproxylists_com(Provider):
@@ -189,9 +206,7 @@ class Blogspot_com_base(Provider):
 
     async def _pipe(self):
         exp = r"""<a href\s*=\s*['"]([^'"]*\.\w+/\d{4}/\d{2}/[^'"#]*)['"]>"""
-        pages = await asyncio.gather(
-            *[self.get("http://%s/" % d) for d in self.domains]
-        )
+        pages = await asyncio.gather(*[self.get(f"http://{d}/") for d in self.domains])
         urls = re.findall(exp, "".join(pages))
         await self._find_on_pages(urls)
 
@@ -217,7 +232,7 @@ class Webanetlabs_net(Provider):
     async def _pipe(self):
         exp = r"""href\s*=\s*['"]([^'"]*proxylist_at_[^'"]*)['"]"""
         page = await self.get("https://webanetlabs.net/publ/24")
-        urls = ["https://webanetlabs.net%s" % path for path in re.findall(exp, page)]
+        urls = [f"https://webanetlabs.net{path}" for path in re.findall(exp, page)]
         await self._find_on_pages(urls)
 
 
@@ -227,9 +242,7 @@ class Checkerproxy_net(Provider):
     async def _pipe(self):
         exp = r"""href\s*=\s*['"](/archive/\d{4}-\d{2}-\d{2})['"]"""
         page = await self.get("https://checkerproxy.net/")
-        urls = [
-            "https://checkerproxy.net/api%s" % path for path in re.findall(exp, page)
-        ]
+        urls = [f"https://checkerproxy.net/api{path}" for path in re.findall(exp, page)]
         await self._find_on_pages(urls)
 
 
@@ -243,7 +256,7 @@ class Proxz_com(Provider):
         exp = r"""href\s*=\s*['"]([^'"]?proxy_list_high_anonymous_[^'"]*)['"]"""  # noqa
         url = "http://www.proxz.com/proxy_list_high_anonymous_0.html"
         page = await self.get(url)
-        urls = ["http://www.proxz.com/%s" % path for path in re.findall(exp, page)]
+        urls = [f"http://www.proxz.com/{path}" for path in re.findall(exp, page)]
         urls.append(url)
         await self._find_on_pages(urls)
 
@@ -260,7 +273,7 @@ class Proxy_list_org(Provider):
         url = "http://proxy-list.org/english/index.php?p=1"
         page = await self.get(url)
         urls = [
-            "http://proxy-list.org/english/%s" % path for path in re.findall(exp, page)
+            f"http://proxy-list.org/english/{path}" for path in re.findall(exp, page)
         ]
         urls.append(url)
         await self._find_on_pages(urls)
@@ -289,7 +302,7 @@ class Aliveproxy_com(Provider):
             "proxy-list-port-8000",
             "proxy-list-port-8080",
         ]
-        urls = ["http://www.aliveproxy.com/%s/" % path for path in paths]
+        urls = [f"http://www.aliveproxy.com/{path}/" for path in paths]
         await self._find_on_pages(urls)
 
 
@@ -320,7 +333,10 @@ class Proxylist_me(Provider):
         exp = r"""href\s*=\s*['"][^'"]*/?page=(\d+)['"]"""
         page = await self.get("https://proxylist.me/")
         lastId = max([int(n) for n in re.findall(exp, page)])
-        urls = ["https://proxylist.me/?page=%d" % n for n in range(lastId)]
+        # range(1, lastId + 1): pages are 1-indexed on this site; the
+        # previous range(lastId) requested ?page=0 (404) and never fetched
+        # the actual last page. Pre-existing master bug.
+        urls = [f"https://proxylist.me/?page={n}" for n in range(1, lastId + 1)]
         await self._find_on_pages(urls)
 
 
@@ -328,7 +344,7 @@ class Foxtools_ru(Provider):
     domain = "foxtools.ru"
 
     async def _pipe(self):
-        urls = ["http://api.foxtools.ru/v2/Proxy.txt?page=%d" % n for n in range(1, 6)]
+        urls = [f"http://api.foxtools.ru/v2/Proxy.txt?page={n}" for n in range(1, 6)]
         await self._find_on_pages(urls)
 
 
@@ -558,7 +574,7 @@ class My_proxy_com(Provider):
         exp = r"""href\s*=\s*['"]([^'"]?free-[^'"]*)['"]"""
         url = "https://www.my-proxy.com/free-proxy-list.html"
         page = await self.get(url)
-        urls = ["https://www.my-proxy.com/%s" % path for path in re.findall(exp, page)]
+        urls = [f"https://www.my-proxy.com/{path}" for path in re.findall(exp, page)]
         urls.append(url)
         await self._find_on_pages(urls)
 
@@ -622,7 +638,7 @@ class Proxyb_net(Provider):
             self._port_pattern.findall(b64decode(port).decode())[0]
             for port in self._port_pattern_b64.findall(_ports)
         ]
-        return [(host, port) for host, port in zip(hosts, ports)]
+        return [(host, port) for host, port in zip(hosts, ports, strict=False)]
 
     async def _pipe(self):
         url = "http://proxyb.net/ajax.php"
@@ -646,7 +662,7 @@ class Proxylistplus_com(Provider):
     async def _pipe(self):
         names = ["Fresh-HTTP-Proxy", "SSL", "Socks"]
         urls = [
-            "http://list.proxylistplus.com/%s-List-%d" % (i, n)
+            f"http://list.proxylistplus.com/{i}-List-{n}"
             for i in names
             for n in range(1, 7)
         ]

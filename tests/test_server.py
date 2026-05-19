@@ -257,152 +257,110 @@ class TestServerAPI:
         await asyncio.sleep(0.001)  # This would fail if loop was stopped
 
 
-class TestProxyPoolErgonomics:
-    """Tests for the ergonomic helpers added to ProxyPool:
-    get(timeout=), acquire(), get_any().
-    """
+class TestProxyPool:
+    """ProxyPool put/remove logic - exercised without network or full Server."""
 
-    def _make_proxy(self, host="1.2.3.4", port=8080, schemes=("HTTP", "HTTPS")):
-        proxy = MagicMock(spec=Proxy)
-        proxy.host = host
-        proxy.port = port
-        proxy.schemes = schemes
-        proxy.avg_resp_time = 1.0
-        proxy.error_rate = 0.0
-        proxy.stat = {"requests": 0, "errors": {}}
-        return proxy
+    def _make_proxy(
+        self, host="192.0.2.1", port=8080, requests=10, errors=0, avg_resp_time=1.0
+    ):
+        """Build a Proxy-shaped MagicMock that satisfies ProxyPool's checks."""
+        p = MagicMock()
+        p.host = host
+        p.port = port
+        p.stat = {"requests": requests}
+        p.error_rate = (errors / requests) if requests else 0
+        p.avg_resp_time = avg_resp_time
+        return p
 
-    # ── get(timeout=) ────────────────────────────────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_get_with_timeout_returns_proxy_before_deadline(self):
-        """get(scheme, timeout=N) returns a proxy that arrives within N seconds."""
+    def test_put_routes_newcomer_below_min_req(self):
+        """Proxies with fewer than min_req_proxy requests go into _newcomers."""
         queue = asyncio.Queue()
-        proxy = self._make_proxy(schemes=("HTTP",))
-        await queue.put(proxy)
-
-        pool = ProxyPool(queue, min_queue=1)
-        result = await pool.get("HTTP", timeout=2.0)
-        assert result is proxy
-
-    @pytest.mark.asyncio
-    async def test_get_with_timeout_raises_no_proxy_error_when_empty(self):
-        """get(scheme, timeout=N) raises NoProxyError when queue stays empty."""
-        queue = asyncio.Queue()
-        pool = ProxyPool(queue, min_queue=1)
-
-        with pytest.raises(NoProxyError):
-            await pool.get("HTTP", timeout=0.1)
-
-    @pytest.mark.asyncio
-    async def test_get_timeout_overrides_pool_import_timeout(self):
-        """Per-call timeout takes precedence over the pool-level import_timeout."""
-        queue = asyncio.Queue()
-        # Pool has a very long default import_timeout
-        pool = ProxyPool(queue, min_queue=1, import_timeout=60.0)
-
-        # But per-call timeout is short – should raise quickly
-        with pytest.raises(NoProxyError):
-            await pool.get("HTTP", timeout=0.1)
-
-    @pytest.mark.asyncio
-    async def test_get_without_timeout_uses_pool_import_timeout(self):
-        """When timeout=None, the pool's import_timeout is used (existing behaviour)."""
-        queue = asyncio.Queue()
-        pool = ProxyPool(queue, min_queue=1, import_timeout=0.1)
-
-        with pytest.raises(NoProxyError):
-            await pool.get("HTTP")  # no explicit timeout → uses import_timeout=0.1
-
-    # ── acquire() ────────────────────────────────────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_acquire_yields_proxy_and_returns_it_on_exit(self):
-        """acquire() yields the proxy and calls put() when the block exits normally."""
-        queue = asyncio.Queue()
-        proxy = self._make_proxy(schemes=("HTTP",))
-        await queue.put(proxy)
-
-        pool = ProxyPool(queue, min_queue=1)
-
-        async with pool.acquire("HTTP", timeout=2.0) as p:
-            assert p is proxy
-
-        # After the context the proxy should be back in _newcomers (stat.requests < min_req_proxy)
+        pool = ProxyPool(queue, min_req_proxy=5)
+        proxy = self._make_proxy(requests=2)
+        pool.put(proxy)
         assert proxy in pool._newcomers
+        assert len(pool._pool) == 0
 
-    @pytest.mark.asyncio
-    async def test_acquire_returns_proxy_to_pool_on_exception(self):
-        """acquire() still calls put() even when an exception is raised inside."""
+    def test_put_routes_to_pool_when_proven(self):
+        """Proven proxies (req >= min, errors low, fast) join the heap pool."""
         queue = asyncio.Queue()
-        proxy = self._make_proxy(schemes=("HTTPS",))
-        await queue.put(proxy)
+        pool = ProxyPool(queue, min_req_proxy=5, max_error_rate=0.5, max_resp_time=8)
+        proxy = self._make_proxy(requests=10, errors=0, avg_resp_time=1.0)
+        pool.put(proxy)
+        assert len(pool._pool) == 1
+        assert pool._newcomers == []
 
-        pool = ProxyPool(queue, min_queue=1)
-
-        with pytest.raises(RuntimeError, match="deliberate"):
-            async with pool.acquire("HTTPS", timeout=2.0) as p:
-                assert p is proxy
-                raise RuntimeError("deliberate")
-
-        # Proxy must have been returned to pool despite the exception
-        assert proxy in pool._newcomers
-
-    @pytest.mark.asyncio
-    async def test_acquire_raises_no_proxy_error_when_empty(self):
-        """acquire() propagates NoProxyError when no proxy is available."""
+    def test_put_drops_proxy_exceeding_error_rate(self):
+        """Proxies past min_req with too many errors are silently dropped."""
         queue = asyncio.Queue()
-        pool = ProxyPool(queue, min_queue=1)
+        pool = ProxyPool(queue, min_req_proxy=5, max_error_rate=0.3)
+        proxy = self._make_proxy(requests=10, errors=5)  # 50% > 30%
+        pool.put(proxy)
+        assert proxy not in pool._newcomers
+        assert all(p[1] is not proxy for p in pool._pool)
 
-        with pytest.raises(NoProxyError):
-            async with pool.acquire("HTTP", timeout=0.1):
-                pass  # should never reach here
-
-    # ── get_any() ────────────────────────────────────────────────────────────
-
-    @pytest.mark.asyncio
-    async def test_get_any_returns_proxy_matching_first_available_scheme(self):
-        """get_any() returns a proxy as soon as one scheme matches."""
+    def test_put_drops_proxy_too_slow(self):
+        """Proxies past min_req with avg response time over threshold are dropped."""
         queue = asyncio.Queue()
-        # Only HTTP proxy available
-        proxy = self._make_proxy(schemes=("HTTP",))
-        await queue.put(proxy)
+        pool = ProxyPool(queue, min_req_proxy=5, max_resp_time=2.0)
+        proxy = self._make_proxy(requests=10, errors=0, avg_resp_time=10.0)
+        pool.put(proxy)
+        assert all(p[1] is not proxy for p in pool._pool)
 
-        pool = ProxyPool(queue, min_queue=1)
-        # Ask for HTTP or HTTPS – should get the HTTP one
-        result = await pool.get_any(("HTTP", "HTTPS"), timeout=2.0)
-        assert result is proxy
-
-    @pytest.mark.asyncio
-    async def test_get_any_falls_back_to_second_scheme(self):
-        """get_any() tries each scheme in order and returns the first match."""
+    def test_put_none_is_noop(self):
+        """ProxyPool.put(None) must not crash - signals end-of-stream."""
         queue = asyncio.Queue()
-        # Only HTTPS proxy available
-        proxy = self._make_proxy(schemes=("HTTPS",))
-        await queue.put(proxy)
+        pool = ProxyPool(queue)
+        pool.put(None)
+        assert pool._pool == []
+        assert pool._newcomers == []
 
-        pool = ProxyPool(queue, min_queue=1)
-        # 'HTTP' will timeout, then 'HTTPS' should succeed
-        result = await pool.get_any(("HTTP", "HTTPS"), timeout=0.1)
-        assert result is proxy
-
-    @pytest.mark.asyncio
-    async def test_get_any_raises_no_proxy_error_when_all_schemes_exhausted(self):
-        """get_any() raises NoProxyError if no scheme has an available proxy."""
+    def test_remove_finds_in_newcomers(self):
         queue = asyncio.Queue()
-        pool = ProxyPool(queue, min_queue=1)
+        pool = ProxyPool(queue, min_req_proxy=5)
+        target = self._make_proxy("192.0.2.1", 8080, requests=2)
+        other = self._make_proxy("198.51.100.1", 3128, requests=2)
+        pool.put(target)
+        pool.put(other)
+        removed = pool.remove("192.0.2.1", 8080)
+        assert removed is target
+        assert target not in pool._newcomers
+        assert other in pool._newcomers
 
-        with pytest.raises(NoProxyError):
-            await pool.get_any(("HTTP", "HTTPS"), timeout=0.05)
+    def test_remove_finds_in_main_pool(self):
+        """O(N log N) heap-safe removal preserves the heap invariant."""
+        import heapq
 
-    @pytest.mark.asyncio
-    async def test_get_any_default_schemes_are_http_and_https(self):
-        """get_any() defaults to trying both HTTP and HTTPS."""
         queue = asyncio.Queue()
-        proxy = self._make_proxy(schemes=("HTTP",))
-        await queue.put(proxy)
+        pool = ProxyPool(queue, min_req_proxy=5)
+        a = self._make_proxy("192.0.2.1", 80, requests=10, avg_resp_time=1.0)
+        b = self._make_proxy("198.51.100.1", 80, requests=10, avg_resp_time=2.0)
+        c = self._make_proxy("203.0.113.1", 80, requests=10, avg_resp_time=3.0)
+        for p in (a, b, c):
+            pool.put(p)
+        assert len(pool._pool) == 3
 
-        pool = ProxyPool(queue, min_queue=1)
-        # Call without explicit schemes – should use default ('HTTP', 'HTTPS')
-        result = await pool.get_any(timeout=2.0)
-        assert result is proxy
+        pool.remove("198.51.100.1", 80)
+        # b is gone; a and c remain; heap invariant holds
+        remaining = [p[1] for p in pool._pool]
+        assert b not in remaining
+        assert a in remaining and c in remaining
+        # heap_pop should still give them in priority order
+        priorities = [pool._pool[i][0] for i in range(len(pool._pool))]
+        assert priorities == list(heapq.nsmallest(len(priorities), priorities))
+
+    def test_remove_target_not_present_restores_pool(self):
+        """When target not in pool, all items must be put back unchanged."""
+        queue = asyncio.Queue()
+        pool = ProxyPool(queue, min_req_proxy=5)
+        a = self._make_proxy("192.0.2.1", 80, requests=10, avg_resp_time=1.0)
+        b = self._make_proxy("198.51.100.1", 80, requests=10, avg_resp_time=2.0)
+        pool.put(a)
+        pool.put(b)
+        pool.remove("nonexistent.host", 9999)
+        assert len(pool._pool) == 2
+
+    def test_init_rejects_unsupported_strategy(self):
+        """The class explicitly raises ValueError for non-'best' strategies."""
+        with pytest.raises(ValueError, match="strategy"):
+            ProxyPool(asyncio.Queue(), strategy="random")

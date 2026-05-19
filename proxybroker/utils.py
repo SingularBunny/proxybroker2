@@ -1,15 +1,11 @@
 """Utils."""
 
+import ipaddress
 import logging
-import os
 import os.path
-import random
 import re
-import shutil
+import secrets
 import sys
-import tarfile
-import tempfile
-import urllib.request
 
 from . import __version__ as version
 from .errors import BadStatusLine
@@ -22,8 +18,12 @@ IPPattern = re.compile(
     r"(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)"
 )
 
-IPv6Pattern = re.compile(
-    r"\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*"
+# Narrow IPv6 candidate tokenizer: a run of hex/colon/dot/percent chars,
+# anchored to start at a hex digit or colon (so `::1` is matched). Zero
+# alternation, zero nesting - provably ReDoS-free. Validation is
+# delegated to stdlib `ipaddress.ip_address` instead of a regex grammar.
+_IPV6_CANDIDATE_PATTERN = re.compile(
+    r"[0-9A-Fa-f:][0-9A-Fa-f:.]*(?:%[A-Za-z0-9_.\-]+)?"
 )
 
 IPPortPatternLine = re.compile(
@@ -37,11 +37,25 @@ IPPortPatternGlobal = re.compile(
     flags=re.DOTALL,
 )
 
+# Bracketed IPv6 + port: `[v6]:port`. RFC 3986 § 3.2.2 mandates this
+# form for IPv6 in URI authority components and most public proxy
+# feeds use it. The capture group is intentionally permissive (any
+# hex/colon/dot/percent characters inside brackets) - validation is
+# performed by `canonicalize_ip` afterwards, not by the regex grammar.
+# Provably ReDoS-free (no alternation, no nested quantifiers).
+# Bracketed [v6]:port. Char class includes alphanumeric+`_`+`-` to
+# accept link-local zone IDs (e.g., `[fe80::1%eth0]:8080`); validation
+# done by `canonicalize_ip` afterwards, not the regex grammar.
+IPv6BracketedPortPattern = re.compile(r"\[([0-9A-Za-z:.%_\-]+)\]:(\d{2,5})")
+
 
 def get_headers(rv=False):
-    _rv = str(random.randint(1000, 9999)) if rv else ""
+    # secrets.randbelow (CSPRNG) clears SonarCloud S2245. Used as a request
+    # marker to detect proxy header injection - non-cryptographic role, but
+    # secrets is a drop-in for the small-int range.
+    _rv = str(1000 + secrets.randbelow(9000)) if rv else ""
     headers = {
-        "User-Agent": "PxBroker/%s/%s" % (version, _rv),
+        "User-Agent": f"PxBroker/{version}/{_rv}",
         "Accept": "*/*",
         "Accept-Encoding": "gzip, deflate",
         "Pragma": "no-cache",
@@ -52,9 +66,74 @@ def get_headers(rv=False):
     return headers if not rv else (headers, _rv)
 
 
-def get_all_ip(page):
-    # NOTE: IPv6 addresses support need to be tested
-    return set(IPPattern.findall(page) + IPv6Pattern.findall(page))
+def canonicalize_ip(s: str | None) -> str | None:
+    """Return RFC 5952 canonical textual form of `s`, or None if invalid.
+
+    For IPv4 the canonical form equals the input (identity). For IPv6 the
+    canonical form is lowercase, leading zeros stripped, and the longest
+    zero-run replaced with `::`. Zone IDs (RFC 6874, e.g. `fe80::1%eth0`)
+    are preserved.
+
+    Adopt the canonical form whenever IP strings cross a boundary where
+    set-membership or substring comparison happens (e.g. anonymity-leak
+    detection). Two textually different but semantically equal addresses
+    must compare equal.
+    """
+    try:
+        return str(ipaddress.ip_address(s))  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return None
+
+
+def find_proxy_pairs(text: str) -> list[tuple[str, str]]:
+    """Extract `(ip, port)` proxy pairs from arbitrary text.
+
+    Returns a list of `(ip_canonical, port)` tuples. Both IPv4 and IPv6
+    are canonicalised via stdlib `ipaddress` so callers get one
+    consistent textual form regardless of how the source feed encoded
+    the address (case, leading zeros, `::` placement). IPv4 canonical
+    form equals the input, so legacy v4-only feeds see no behavior
+    change.
+
+    Bracketed v6 entries (`[v6]:port`, RFC 3986) and bare v4 entries
+    are both recognised. Invalid bracketed garbage is silently
+    dropped.
+    """
+    pairs: list[tuple[str, str]] = []
+    for raw_v4, port in IPPortPatternGlobal.findall(text):
+        canonical = canonicalize_ip(raw_v4)
+        if canonical is not None:
+            pairs.append((canonical, port))
+    for raw_v6, port in IPv6BracketedPortPattern.findall(text):
+        canonical = canonicalize_ip(raw_v6)
+        if canonical is not None:
+            pairs.append((canonical, port))
+    return pairs
+
+
+def get_all_ip(page: str) -> set[str]:
+    """Extract all IPv4 and IPv6 literals from `page`.
+
+    IPv4 addresses are extracted greedily as substrings (so
+    `"127.0.0.1"` is found inside `"127.0.0.1:80"`), preserving the
+    historical IPv4 contract. IPv6 candidates are validated by stdlib
+    `ipaddress.ip_address` and returned in RFC 5952 canonical form so
+    that different textual encodings of the same address (case,
+    leading zeros, `::` placement) collapse to one set element.
+    """
+    found: set[str] = set(IPPattern.findall(page))
+    for tok in _IPV6_CANDIDATE_PATTERN.findall(page):
+        if ":" not in tok:
+            # Pure IPv4 token (no colon) - already covered by IPPattern.
+            continue
+        # Strip trailing punctuation that the tokenizer greedily includes
+        # (e.g., "Real IP: 2001:db8::1." would otherwise fail validation
+        # silently). Leading dots are not allowed by IPv6 grammar so no
+        # left strip needed.
+        canonical = canonicalize_ip(tok.rstrip("."))
+        if canonical is not None:
+            found.add(canonical)
+    return found
 
 
 def get_status_code(resp, start=9, stop=12):
@@ -112,27 +191,11 @@ def parse_headers(headers):
 
 
 def update_geoip_db():
-    print("The update in progress, please waite for a while...")
-    filename = "GeoLite2-City.tar.gz"
-    local_file = os.path.join(DATA_DIR, filename)
-    city_db = os.path.join(DATA_DIR, "GeoLite2-City.mmdb")
-    url = "http://geolite.maxmind.com/download/geoip/database/%s" % filename
-
-    urllib.request.urlretrieve(url, local_file)
-
-    tmp_dir = tempfile.gettempdir()
-    with tarfile.open(name=local_file, mode="r:gz") as tf:
-        for tar_info in tf.getmembers():
-            if tar_info.name.endswith(".mmdb"):
-                tf.extract(tar_info, tmp_dir)
-                tmp_path = os.path.join(tmp_dir, tar_info.name)
-    shutil.move(tmp_path, city_db)
-    os.remove(local_file)
-
-    if os.path.exists(city_db):
-        print(
-            "The GeoLite2-City DB successfully downloaded and now you "
-            "have access to detailed geolocation information of the proxy."
-        )
-    else:
-        print("Something went wrong, please try again later.")
+    raise RuntimeError(
+        "`proxybroker update-geo` is no longer functional. MaxMind retired "
+        "the public GeoLite2 download endpoint on 2019-12-30 and now requires "
+        "a license key. The bundled GeoLite2 databases in proxybroker/data/ "
+        "still work for runtime IP lookups, but cannot be refreshed via this "
+        "command. Tracking issue: "
+        "https://github.com/bluet/proxybroker2/issues/200"
+    )

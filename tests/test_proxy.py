@@ -1,3 +1,5 @@
+import asyncio
+import ssl
 import time
 from asyncio.streams import StreamReader
 
@@ -8,11 +10,73 @@ from proxybroker.errors import ProxyConnError, ProxyTimeoutError, ResolveError
 from proxybroker.negotiators import HttpsNgtr
 from proxybroker.utils import log as logger
 
-from .utils import ResolveResult, future_iter
+from .utils import ResolveResult
+
+
+def test_ssl_context_unverified_by_default():
+    """When verify_ssl is False (the default for proxy testing),
+    self._ssl_context must be a real SSLContext with cert verification
+    fully disabled. Guards the migration from the private
+    ssl._create_unverified_context() to the public
+    ssl.create_default_context() + override path.
+    """
+    p = Proxy("127.0.0.1", "80", verify_ssl=False)
+    assert isinstance(p._ssl_context, ssl.SSLContext)
+    assert p._ssl_context.check_hostname is False
+    assert p._ssl_context.verify_mode == ssl.CERT_NONE
+
+
+def test_ssl_context_verified_when_requested():
+    """verify_ssl=True keeps the True sentinel - existing contract."""
+    p = Proxy("127.0.0.1", "80", verify_ssl=True)
+    assert p._ssl_context is True
+
+
+def test_proxy_accepts_ipv6_host_literal():
+    """Proxy(host=v6) must construct without raising.
+
+    Relies on Resolver.host_is_ip accepting v6 literals (L1).
+    Geo-info lookup tolerates absent v6 ranges in the bundled
+    GeoLite2 DB and falls back to "Unknown".
+    """
+    p = Proxy("2001:db8::1", "8080")
+    assert p.host == "2001:db8::1"
+    assert p.port == 8080
+
+
+def test_proxy_rejects_v6_with_brackets():
+    """Brackets are URI authority syntax (RFC 3986), not the literal
+    host - must NOT be accepted as a Proxy host. Caller should strip
+    brackets before constructing.
+    """
+    with pytest.raises(ValueError):
+        Proxy("[2001:db8::1]", "8080")
+
+
+def test_proxy_as_text_brackets_v6():
+    """as_text emits standard host:port form. For IPv6 hosts, RFC 3986
+    requires brackets so the colon doesn't ambiguate against the port.
+    """
+    v4 = Proxy("127.0.0.1", "80")
+    assert v4.as_text() == "127.0.0.1:80\n"
+
+    v6 = Proxy("2001:db8::1", "8080")
+    assert v6.as_text() == "[2001:db8::1]:8080\n"
+
+
+def test_proxy_repr_brackets_v6():
+    """repr() of a v6-host proxy must bracket the host so logs are
+    unambiguous.
+    """
+    p = Proxy("2001:db8::1", "8080")
+    assert "[2001:db8::1]:8080" in repr(p)
 
 
 @pytest.fixture
-def proxy():
+async def proxy():
+    # async fixture so pytest-asyncio sets up an event loop first.
+    # StreamReader() requires a running loop on Python 3.14+
+    # (was a DeprecationWarning on 3.10-3.13, became RuntimeError in 3.14).
     proxy = Proxy("127.0.0.1", "80", timeout=0.1)
     proxy._reader["conn"] = StreamReader()
     return proxy
@@ -29,11 +93,20 @@ async def test_create_by_ip():
 
 @pytest.mark.asyncio
 async def test_create_by_domain(mocker):
-    f = future_iter([ResolveResult("127.0.0.1", 0)])
-    # pytest-mock teardonw is done when existing thr fixture object
-    # no need context manager
-    # https://github.com/pytest-dev/pytest-mock#note-about-usage-as-context-manager
-    mocker.patch("aiodns.DNSResolver.query", side_effect=f)
+    # Resolver.resolve() races A and AAAA in parallel (Happy Eyeballs DNS,
+    # RFC 8305 § 3). Mock provides a v4 record for A and explicitly fails
+    # AAAA so the v4 result wins deterministically.
+    import aiodns
+
+    a_future = asyncio.Future()
+    a_future.set_result([ResolveResult("127.0.0.1", 0)])
+
+    def query_side_effect(host, qtype):
+        if qtype == "A":
+            return a_future
+        raise aiodns.error.DNSError(1, "no AAAA record (test)")
+
+    mocker.patch("aiodns.DNSResolver.query", side_effect=query_side_effect)
     proxy = await Proxy.create("testhost.com", "80")
     assert proxy.host == "127.0.0.1"
 
@@ -197,7 +270,7 @@ async def test_recv_eof(proxy):
 
 
 @pytest.mark.asyncio
-async def test_recv_length(event_loop, proxy):
+async def test_recv_length(proxy):
     proxy.reader.feed_data(b"abc")
     assert await proxy.recv(length=3) == b"abc"
     proxy.reader._buffer.clear()
@@ -213,7 +286,7 @@ async def test_recv_length(event_loop, proxy):
 
 
 @pytest.mark.asyncio
-async def test_recv_head_only(event_loop, proxy):
+async def test_recv_head_only(proxy):
     data = b"HTTP/1.1 200 Connection established\r\n\r\n"
     proxy.reader.feed_data(data)
     assert await proxy.recv(head_only=True) == data
@@ -248,7 +321,7 @@ async def test_recv_content_encoding(proxy):
 
 
 @pytest.mark.asyncio
-async def test_recv_content_encoding_without_eof(event_loop, proxy):
+async def test_recv_content_encoding_without_eof(proxy):
     resp = (
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Encoding: gzip\r\n"

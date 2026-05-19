@@ -4,8 +4,9 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -13,6 +14,32 @@ if sys.platform == "win32":
 from . import __version__ as version
 from .api import Broker
 from .utils import update_geoip_db
+
+
+def _add_provider_dir_arg(parser_or_group, dest):
+    """Add --provider-dir to a parser, storing into the given dest.
+
+    We use DIFFERENT dest names on the top-level parser
+    (``_provider_dirs_top``) versus each subparser (``provider_dirs``)
+    and merge them in `_resolve_provider_dirs`. This is the workaround
+    for an argparse limitation: when the same option lives on both a
+    parent and a subparser, the subparser's `action="append"` starts
+    from the default and silently overwrites whatever the top-level
+    captured. With separate dests both lists survive intact.
+    """
+    parser_or_group.add_argument(
+        "--provider-dir",
+        action="append",
+        dest=dest,
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help=(
+            "Directory of YAML/JSON provider configs to load on startup. "
+            "Repeatable. Falls back to $PROXYBROKER_PROVIDER_DIR, then to "
+            "/configs if it exists (Docker convention). Only data files "
+            "are read; no Python is executed."
+        ),
+    )
 
 
 def create_parser():
@@ -25,6 +52,11 @@ def create_parser():
                   Suggestions and bug reports are greatly appreciated:
                   https://github.com/bluet/proxybroker2/issues""",
     )
+    # Top-level --provider-dir stores into a separate dest so values
+    # supplied before the subcommand survive even when the user also
+    # supplies --provider-dir after the subcommand. Merged in
+    # _resolve_provider_dirs.
+    _add_provider_dir_arg(parser, dest="_provider_dirs_top")
 
     subparsers = parser.add_subparsers(
         dest="command",
@@ -41,6 +73,7 @@ def create_parser():
         help="Find and check proxies",
         description="Find and check proxies with specified parameters",
     )
+    _add_provider_dir_arg(fparser, dest="provider_dirs")
     fparser_group = fparser.add_argument_group(title="Options")
     add_find_args(fparser_group)
     add_grab_args(fparser_group)
@@ -56,6 +89,7 @@ def create_parser():
         help="Find proxies without a check",
         description="Find proxies without a check with specified parameters",
     )
+    _add_provider_dir_arg(gparser, dest="provider_dirs")
     gparser_group = gparser.add_argument_group(title="Options")
     add_grab_args(gparser_group)
     add_limit_arg(gparser_group)
@@ -72,6 +106,7 @@ def create_parser():
                        external proxies, which will be found on the
                        specified parameters""",
     )
+    _add_provider_dir_arg(sparser, dest="provider_dirs")
     add_serve_args(sparser.add_argument_group(title="Server options"))
     sparser_fgroup = sparser.add_argument_group(title="Find proxies options")
     add_find_args(sparser_fgroup)
@@ -89,11 +124,12 @@ def create_parser():
     uparser = subparsers.add_parser(
         "update-geo",
         add_help=False,
-        help="Download and use a detailed GeoIP database",
+        help="(broken since 2019) Download GeoIP database - see issue #200",
         description=(
-            "Download and use a detailed GeoIP DB to get "
-            "additional geolocation information of the proxy "
-            "(ISO and name of region, city name)."
+            "Originally downloaded a detailed GeoIP DB for additional "
+            "geolocation information. MaxMind retired the public download "
+            "endpoint on 2019-12-30; this command now raises an error. "
+            "Tracking issue: https://github.com/bluet/proxybroker2/issues/200"
         ),
     )
     uparser_group = uparser.add_argument_group(title="Options")
@@ -139,6 +175,10 @@ def add_broker_args(group):
         dest="providers",
         help="Urls of pages where to find proxies",
     )
+    # NOTE: --provider-dir is defined separately on _provider_dir_parent so
+    # both `proxybroker --provider-dir X find` and `proxybroker find
+    # --provider-dir X` work. argparse subparsers do not inherit top-level
+    # parser args, so the flag has to be reachable through a parent parser.
     group.add_argument(
         "--verify-ssl",
         "-ssl",
@@ -181,7 +221,7 @@ def add_find_args(group):
     )
     group.add_argument(
         "--data",
-        type=argparse.FileType("r"),
+        type=str,
         help="""Path to the file with proxies.
                 If specified, used instead of providers""",
     )
@@ -300,8 +340,8 @@ def add_outfile_arg(group):
     group.add_argument(
         "--outfile",
         "-o",
-        type=argparse.FileType("w", 1),
-        default=sys.stdout,
+        type=str,
+        default=None,
         help="Save found proxies to file. By default, output to console",
     )
 
@@ -355,16 +395,42 @@ async def handle(proxies, outfile, format):
                 break
 
             if is_json:
-                line = "%s" % json.dumps(proxy.as_json())
+                line = f"{json.dumps(proxy.as_json())}"
             elif is_txt:
                 line = proxy.as_text()
             else:
-                line = "%r\n" % proxy
+                line = f"{proxy!r}\n"
 
             if is_json and not is_first:
                 outfile.write(",\n")
             outfile.write(line)
             is_first = False
+
+
+def _resolve_provider_dirs(ns):
+    """Resolve provider directories from CLI flag, env var, then convention.
+
+    Priority order:
+      1. ``--provider-dir`` (one or more on the command line)
+      2. ``$PROXYBROKER_PROVIDER_DIR`` (single path)
+      3. ``/configs`` if present in-container (Docker bind-mount convention)
+
+    Returns ``None`` when nothing is configured, so the Broker keeps its
+    default behaviour.
+    """
+    # Merge both positional sources of --provider-dir (top-level + subcommand)
+    # so values supplied in either position - or both - all flow through.
+    # See _add_provider_dir_arg for why the dests are different.
+    cli_dirs = list(getattr(ns, "_provider_dirs_top", None) or [])
+    cli_dirs.extend(getattr(ns, "provider_dirs", None) or [])
+    if cli_dirs:
+        return cli_dirs
+    env_dir = os.environ.get("PROXYBROKER_PROVIDER_DIR")
+    if env_dir:
+        return [env_dir]
+    if os.path.isdir("/configs"):
+        return ["/configs"]
+    return None
 
 
 def cli(args=sys.argv[1:]):
@@ -388,66 +454,82 @@ def cli(args=sys.argv[1:]):
         ns.types.remove("HTTP")
         ns.types.append(("HTTP", ns.anon_lvl))
 
-    loop = asyncio.get_event_loop_policy().get_event_loop()
-    proxies = asyncio.Queue()
-    broker = Broker(
-        proxies,
-        max_conn=ns.max_conn,
-        max_tries=ns.max_tries,
-        timeout=ns.timeout,
-        judges=ns.judges,
-        providers=ns.providers,
-        verify_ssl=ns.verify_ssl,
-        loop=loop,
-    )
+    with ExitStack() as files:
+        if ns.command in ("find", "serve") and ns.data is not None:
+            if ns.data == "-":
+                ns.data = sys.stdin
+            else:
+                ns.data = files.enter_context(open(ns.data, encoding="utf-8"))
+        if ns.command in ("find", "grab"):
+            if ns.outfile is None or ns.outfile == "-":
+                ns.outfile = sys.stdout
+            else:
+                ns.outfile = files.enter_context(
+                    open(ns.outfile, "w", buffering=1, encoding="utf-8")
+                )
 
-    if ns.command in ("find", "grab"):
-        tasks = [handle(proxies, outfile=ns.outfile, format=ns.format)]
-    else:
-        tasks = []
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        proxies = asyncio.Queue()
+        broker = Broker(
+            proxies,
+            max_conn=ns.max_conn,
+            max_tries=ns.max_tries,
+            timeout=ns.timeout,
+            judges=ns.judges,
+            providers=ns.providers,
+            provider_dirs=_resolve_provider_dirs(ns),
+            verify_ssl=ns.verify_ssl,
+            loop=loop,
+        )
 
-    if ns.command == "find":
-        tasks.append(
-            broker.find(
+        if ns.command in ("find", "grab"):
+            tasks = [handle(proxies, outfile=ns.outfile, format=ns.format)]
+        else:
+            tasks = []
+
+        if ns.command == "find":
+            tasks.append(
+                broker.find(
+                    data=ns.data,
+                    types=ns.types,
+                    countries=ns.countries,
+                    post=ns.post,
+                    strict=ns.strict,
+                    dnsbl=ns.dnsbl,
+                    limit=ns.limit,
+                )
+            )
+        elif ns.command == "grab":
+            tasks.append(broker.grab(countries=ns.countries, limit=ns.limit))
+        elif ns.command == "serve":
+            broker.serve(
+                host=ns.host,
+                port=ns.port,
+                limit=ns.limit,
+                min_queue=ns.min_queue,
+                strategy=ns.strategy,
+                min_req_proxy=ns.min_req_proxy,
+                max_error_rate=ns.max_error_rate,
+                max_resp_time=ns.max_resp_time,
+                prefer_connect=ns.prefer_connect,
+                http_allowed_codes=ns.http_allowed_codes,
+                backlog=ns.backlog,
                 data=ns.data,
                 types=ns.types,
                 countries=ns.countries,
                 post=ns.post,
                 strict=ns.strict,
                 dnsbl=ns.dnsbl,
-                limit=ns.limit,
             )
-        )
-    elif ns.command == "grab":
-        tasks.append(broker.grab(countries=ns.countries, limit=ns.limit))
-    elif ns.command == "serve":
-        broker.serve(
-            host=ns.host,
-            port=ns.port,
-            limit=ns.limit,
-            min_queue=ns.min_queue,
-            strategy=ns.strategy,
-            min_req_proxy=ns.min_req_proxy,
-            max_error_rate=ns.max_error_rate,
-            max_resp_time=ns.max_resp_time,
-            prefer_connect=ns.prefer_connect,
-            http_allowed_codes=ns.http_allowed_codes,
-            backlog=ns.backlog,
-            data=ns.data,
-            types=ns.types,
-            countries=ns.countries,
-            post=ns.post,
-            strict=ns.strict,
-            dnsbl=ns.dnsbl,
-        )
-        print("Server started at http://%s:%d" % (ns.host, ns.port))
+            print(f"Server started at http://{ns.host}:{ns.port}")
 
-    try:
-        if tasks:
-            loop.run_until_complete(asyncio.gather(*tasks))
-            if ns.show_stats:
-                broker.show_stats(verbose=True)
-        else:
-            loop.run_forever()
-    except KeyboardInterrupt:
-        broker.stop()
+        try:
+            if tasks:
+                loop.run_until_complete(asyncio.gather(*tasks))
+                if ns.show_stats:
+                    broker.show_stats(verbose=True)
+            else:
+                loop.run_forever()
+        except KeyboardInterrupt:
+            broker.stop()

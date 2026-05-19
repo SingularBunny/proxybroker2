@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ProxyBroker2 is an async proxy finder, checker, and server. It discovers public proxies from 50+ sources, validates them against judge servers, and can operate as a rotating proxy server.
 
 **Repository**: `bluet/proxybroker2` (GitHub)
-**Python**: 3.10-3.13
+**Python**: 3.10-3.14
 **Key Dependencies**: aiohttp 3.12.0+, aiodns 3.4.0+, attrs 25.3.0+, asyncio
 
 ## Common Development Commands
@@ -120,6 +120,24 @@ PROVIDERS if providers is None else providers
 ### Protocol Priority
 Deterministic order: SOCKS5 → SOCKS4 → CONNECT:80 → CONNECT:25 → HTTPS → HTTP
 
+### IPv6 Support
+First-class alongside IPv4 across the stack (PR for #201). Key invariants:
+- **Canonical form is RFC 5952** (`str(ipaddress.ip_address(...))`):
+  lowercase, leading-zeros stripped, longest zero-run as `::`. Use
+  `proxybroker.utils.canonicalize_ip(s) -> str | None` at every
+  boundary where IPs cross from text into comparison.
+- **IPv4 contracts are preserved**. `IPPattern.findall` still handles
+  the legacy substring extraction (e.g. `127.0.0.1` from `127.0.0.1:80`).
+  Canonical form for IPv4 is identity, so set membership behavior is
+  unchanged for the IPv4 path.
+- **IPv6 in URI authority MUST be bracketed** (RFC 3986). `Proxy.as_text`,
+  `Proxy.__repr__`, and proxy-list output all bracket v6 hosts.
+- **SOCKS5 `ATYP=0x04`** for IPv6 destinations; SOCKS4 stays IPv4-only
+  by spec (no v6 ATYP in RFC 1928).
+- **Provider feeds**: `[v6]:port` is parsed via `IPv6BracketedPortPattern`
+  + stdlib validation. Helper `find_proxy_pairs(text)` returns
+  `[(ip_canonical, port), ...]` for both v4 and v6.
+
 ### Signal Handler Cleanup
 `Broker.stop()` properly removes signal handlers to prevent memory leaks
 
@@ -174,6 +192,25 @@ docs/source/
 ├── changelog.md     # Auto-included from root CHANGELOG.md
 └── index.rst        # Main documentation page
 ```
+
+## Custom Providers
+
+Users can add their own proxy sources without modifying the codebase. The
+primary UX is Docker bind-mount: drop `*.yaml` / `*.yml` / `*.json` configs
+into a directory, mount it as `/configs`, and the CLI auto-loads them.
+
+- `--provider-dir PATH` (repeatable) on the CLI
+- `PROXYBROKER_PROVIDER_DIR` env var fallback (single path)
+- `/configs` is the in-container default if it exists
+- `Broker(provider_dirs=[...])` from Python; `providers=[]` means "no
+  bundled defaults" (preserved contract)
+- Helper classes in `proxybroker.provider_utils`: `SimpleProvider`,
+  `PaginatedProvider`, `APIProvider`, `ConfigurableProvider`
+- `load_provider_configs_from_directory()` reads only YAML/JSON (safe for
+  bind-mounts). `load_python_providers_from_directory()` executes `.py`
+  files - opt-in only, never wired to the CLI.
+
+See `docs/custom_providers.md` for the full guide.
 
 ## Known Quirks
 

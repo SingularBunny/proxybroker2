@@ -17,7 +17,14 @@ from .errors import (
 from .judge import Judge, get_judges
 from .negotiators import NGTRS
 from .resolver import Resolver
-from .utils import get_all_ip, get_headers, get_status_code, log, parse_headers
+from .utils import (
+    canonicalize_ip,
+    get_all_ip,
+    get_headers,
+    get_status_code,
+    log,
+    parse_headers,
+)
 
 
 class Checker:
@@ -35,6 +42,8 @@ class Checker:
         types=None,
         post=False,
         loop=None,
+        *,
+        real_ext_ips=None,
         verify_url=None,
         verify_timeout=10,
         verify_ok_statuses=None,
@@ -55,7 +64,27 @@ class Checker:
         self._judges = get_judges(judges, timeout, verify_ssl)
         self._method = "POST" if post else "GET"
         self._max_tries = max_tries
-        self._real_ext_ip = real_ext_ip
+        # Set-aware ext-IP storage (#220). On dual-stack hosts the
+        # discovery returns BOTH families so judge response comparison
+        # passes regardless of which family the judge connection used.
+        # Backward-compat: legacy `real_ext_ip` (single string) is
+        # accepted and wrapped into the set; if both args are passed the
+        # newer plural argument wins.
+        # `real_ext_ips` is keyword-only so existing positional callers
+        # like `Checker(judges, 3, 8, False, False, None, ip, types)`
+        # don't get their `types`-and-after args silently shifted.
+        if real_ext_ips is None and real_ext_ip is not None:
+            real_ext_ips = (real_ext_ip,)
+        # Defensive: a caller passing a single str (e.g. misreading the
+        # plural arg name) gets it treated as one IP, not iterated into
+        # a set of individual characters.
+        if isinstance(real_ext_ips, str):
+            real_ext_ips = (real_ext_ips,)
+        self._real_ext_ips = frozenset(real_ext_ips or ())
+        # Legacy single-string accessor preserved for any external code.
+        self._real_ext_ip = (
+            next(iter(self._real_ext_ips)) if self._real_ext_ips else None
+        )
         self._strict = strict
         self._dnsbl = dnsbl or []
         self._types = types or {}
@@ -82,12 +111,12 @@ class Checker:
         log.debug("Start check judges")
         stime = time.time()
         await asyncio.gather(
-            *[j.check(real_ext_ip=self._real_ext_ip) for j in self._judges]
+            *[j.check(real_ext_ips=self._real_ext_ips) for j in self._judges]
         )
 
         self._judges = [j for j in self._judges if j.is_working]
         log.debug(
-            "%d judges added. Runtime: %.4f;" % (len(self._judges), time.time() - stime)
+            f"{len(self._judges)} judges added. Runtime: {time.time() - stime:.4f};"
         )
 
         nojudges = []
@@ -122,7 +151,7 @@ class Checker:
                 stacklevel=2,
             )
         if self._judges:
-            log.debug("Loaded: %d proxy judges" % len(set(self._judges)))
+            log.debug(f"Loaded: {len(set(self._judges))} proxy judges")
         else:
             raise RuntimeError("Not found judges")
 
@@ -233,9 +262,10 @@ class Checker:
                 result = await self._check(proxy, proto)
             results.append(result)
 
-        proxy.is_working = True if any(results) else False
+        working = any(results)
+        proxy.is_working = working
 
-        if proxy.is_working and self._types_passed(proxy):
+        if working and self._types_passed(proxy):
             if self._verify_url:
                 return await self._verify_against_url(proxy)
             return True
@@ -243,7 +273,7 @@ class Checker:
 
     async def _check_conn_25(self, proxy, proto):
         judge = Judge.get_random(proto)
-        proxy.log("Selected judge: %s" % judge)
+        proxy.log(f"Selected judge: {judge}")
         result = False
         for _ in range(self._max_tries):
             try:
@@ -271,7 +301,7 @@ class Checker:
 
     async def _check(self, proxy, proto):
         judge = Judge.get_random(proto)
-        proxy.log("Selected judge: %s" % judge)
+        proxy.log(f"Selected judge: {judge}")
         result = False
         for _ in range(self._max_tries):
             try:
@@ -298,7 +328,7 @@ class Checker:
                 if result:
                     if proxy.ngtr.check_anon_lvl:
                         lvl = _get_anonymity_lvl(
-                            self._real_ext_ip, proxy, judge, content
+                            self._real_ext_ips, proxy, judge, content
                         )
                     else:
                         lvl = None
@@ -318,8 +348,8 @@ def _request(method, host, path, fullpath=False, data=""):
         hdrs["Content-Type"] = "application/octet-stream"
     kw = {
         "method": method,
-        "path": "http://%s%s" % (host, path) if fullpath else path,  # HTTP
-        "headers": "\r\n".join(("%s: %s" % (k, v) for k, v in hdrs.items())),
+        "path": f"http://{host}{path}" if fullpath else path,  # HTTP
+        "headers": "\r\n".join((f"{k}: {v}" for k, v in hdrs.items())),
         "data": data,
     }
     req = ("{method} {path} HTTP/1.1\r\n{headers}\r\n\r\n{data}").format(**kw).encode()
@@ -348,14 +378,7 @@ async def _send_test_request(method, proxy, judge):
     finally:
         proxy.log("Get: %s" % ("success" if content else "failed"), err=err)
         log.debug(
-            "{h}:{p} [{n}]: ({j}) rv: {rv}, response: {resp}".format(
-                h=proxy.host,
-                p=proxy.port,
-                n=proxy.ngtr.name,
-                j=judge.url,
-                rv=rv,
-                resp=resp,
-            )
+            f"{proxy.host}:{proxy.port} [{proxy.ngtr.name}]: ({judge.url}) rv: {rv}, response: {resp}"
         )
     return headers, content, rv
 
@@ -389,21 +412,40 @@ def _check_test_response(proxy, headers, content, rv):
         return True
     else:
         proxy.log(
-            "Response: not correct; ip: %s, rv: %s, ref: %s, cookie: %s"
-            % (bool(foundIP), verIsCorrect, refSupported, cookieSupported)
+            f"Response: not correct; ip: {bool(foundIP)}, rv: {verIsCorrect}, ref: {refSupported}, cookie: {cookieSupported}"
         )
         return False
 
 
-def _get_anonymity_lvl(real_ext_ip, proxy, judge, content):
+def _get_anonymity_lvl(real_ext_ips, proxy, judge, content):
+    """Classify a proxy as Transparent / Anonymous / High.
+
+    `real_ext_ips` accepts either an iterable of canonical IP strings
+    (the SOTA set-aware path used by Checker) or a single string (the
+    legacy single-ext-IP API). Empty/None means no real IP known —
+    Transparent classification disabled.
+
+    Set semantics: Transparent if ANY of the host's real ext-IPs (v4
+    OR v6) appear in the page. Critical for dual-stack hosts where a
+    judge response may echo whichever family the connection used.
+    """
     content = content.lower()
     foundIP = get_all_ip(content)
+
+    # Normalise input to a frozenset of canonical strings.
+    if real_ext_ips is None:
+        real_canonicals = frozenset()
+    elif isinstance(real_ext_ips, str):
+        # Legacy single-string contract.
+        real_canonicals = frozenset({canonicalize_ip(real_ext_ips) or real_ext_ips})
+    else:
+        real_canonicals = frozenset(canonicalize_ip(ip) or ip for ip in real_ext_ips)
 
     via = (content.count("via") > judge.marks["via"]) or (
         content.count("proxy") > judge.marks["proxy"]
     )
 
-    if real_ext_ip in foundIP:
+    if real_canonicals & foundIP:
         lvl = "Transparent"
     elif via:
         lvl = "Anonymous"

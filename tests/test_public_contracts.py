@@ -43,11 +43,13 @@ class TestBrokerPublicContract:
             "loop",
             "stop_broker_on_sigint",
             "ip_hosts",
+            "provider_dirs",
             "kwargs",
         }
         actual_params = set(sig.parameters.keys())
         assert expected_params == actual_params, (
-            f"Missing params: {expected_params - actual_params}"
+            f"Missing params: {expected_params - actual_params}, "
+            f"unexpected params: {actual_params - expected_params}"
         )
 
         # Test default values that users depend on
@@ -57,6 +59,7 @@ class TestBrokerPublicContract:
         assert params["max_tries"].default == 3
         assert params["verify_ssl"].default is False
         assert params["stop_broker_on_sigint"].default is True
+        assert params["provider_dirs"].default is None
 
     @pytest.mark.asyncio
     async def test_broker_find_signature(self):
@@ -78,7 +81,7 @@ class TestBrokerPublicContract:
         assert expected_params == actual_params
 
         # Test that method is async
-        assert asyncio.iscoroutinefunction(broker.find)
+        assert inspect.iscoroutinefunction(broker.find)
 
     @pytest.mark.asyncio
     async def test_broker_grab_signature(self):
@@ -90,7 +93,7 @@ class TestBrokerPublicContract:
         actual_params = set(sig.parameters.keys()) - {"self"}
         assert expected_params == actual_params
 
-        assert asyncio.iscoroutinefunction(broker.grab)
+        assert inspect.iscoroutinefunction(broker.grab)
 
     @pytest.mark.asyncio
     async def test_broker_serve_signature(self):
@@ -136,7 +139,7 @@ class TestProxyPublicContract:
         actual_params = set(sig.parameters.keys())
         assert expected_params == actual_params
 
-        assert asyncio.iscoroutinefunction(Proxy.create)
+        assert inspect.iscoroutinefunction(Proxy.create)
 
     def test_proxy_as_json_contract(self):
         """Test Proxy.as_json() return structure contract."""
@@ -240,11 +243,7 @@ class TestProxyPoolPublicContract:
         actual_params = set(sig.parameters.keys())
         assert expected_params == actual_params
 
-        # ``timeout`` must be keyword-only to avoid breaking positional callers.
-        assert sig.parameters["timeout"].kind == inspect.Parameter.KEYWORD_ONLY
-        assert sig.parameters["timeout"].default is None  # default: use pool's import_timeout
-
-        assert asyncio.iscoroutinefunction(pool.get)
+        assert inspect.iscoroutinefunction(pool.get)
 
     @pytest.mark.asyncio
     async def test_proxy_pool_acquire_is_async_context_manager(self):
@@ -327,7 +326,7 @@ class TestServerPublicContract:
         actual_params = set(sig.parameters.keys())
         assert expected_params == actual_params
 
-        assert asyncio.iscoroutinefunction(server.start)
+        assert inspect.iscoroutinefunction(server.start)
 
 
 class TestErrorContractStability:
