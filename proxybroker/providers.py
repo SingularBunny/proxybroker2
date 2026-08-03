@@ -789,6 +789,34 @@ class ProxyProvider(Provider):
 
 
 PROVIDERS = [
+    # ── Источники, добавленные по замеру (PB11) ───────────────────────────────
+    #
+    # Список источников легко пополнять по репутации и невозможно так проверить.
+    # Замер вклада показал, что из прежних 38 провайдеров живые прокси дают
+    # шесть, а `api.proxyscrape.com` даёт 68% пула — то есть весь пул держался
+    # на одном API. Эти два источника отобраны прогоном `tools/rate_sources.py`
+    # по единственному значимому критерию: сколько адресов реально проходят
+    # судей.
+    #
+    # Замер, 180 секунд:
+    #   openproxylist.xyz  отдал 2552, новых 2552, **живых 215**
+    #   spys.me            отдал  400, новых  280, **живых  51**
+    # Для сравнения `api.proxyscrape.com` в том же режиме даёт 235 живых, то
+    # есть openproxylist сопоставим с ним по вкладу и стоит на совершенно
+    # другой инфраструктуре — это второй столб, а не ещё одно зеркало GitHub.
+    #
+    # Отдельно важно для гео-фильтра: из 266 живых 47 оказались российскими,
+    # а именно нехватка RU-адресов однажды оставила пул пустым на 17 часов.
+    Provider(url="https://openproxylist.xyz/socks5.txt", proto=("SOCKS5",)),
+    Provider(url="https://openproxylist.xyz/socks4.txt", proto=("SOCKS4",)),
+    Provider(
+        url="https://openproxylist.xyz/http.txt",
+        proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25"),
+    ),
+    Provider(
+        url="https://spys.me/proxy.txt",
+        proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25"),
+    ),
     Provider(
         url="http://www.proxylists.net/",
         proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25"),
@@ -866,7 +894,12 @@ PROVIDERS = [
     Foxtools_ru(proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25"), max_conn=1),  # noqa: E501
     Gatherproxy_com(proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25")),  # noqa: E501
     Nntime_com(proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25")),  # noqa: E501
-    Blogspot_com(proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25")),  # noqa: E501
+    # Blogspot_com отключён по замеру: отдаёт больше 200 адресов за проход и
+    # ни одного живого. Источник, публикующий объём без результата, не просто
+    # бесполезен — он занимает слоты проверки, которые могли бы достаться
+    # рабочим адресам. Класс оставлен: если блог оживёт, вернуть его будет
+    # одной строкой, а замер покажет, стоило ли.
+    # Blogspot_com(proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25")),
     Gatherproxy_com_socks(proto=("SOCKS4", "SOCKS5")),  # noqa: E501
     Blogspot_com_socks(proto=("SOCKS4", "SOCKS5")),  # noqa: E501
     Tools_rosinstrument_com(proto=("HTTP", "CONNECT:80", "HTTPS", "CONNECT:25")),  # noqa: E501
