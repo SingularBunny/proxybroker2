@@ -59,6 +59,10 @@ class TestBrokerPublicContract:
             # Бюджет времени на один источник: зависший провайдер задерживает
             # пополнение пула для всех остальных.
             "provider_timeout",
+            # Мёртвые адреса перепроверялись каждый проход: ~3500 из 3800
+            # кандидатов занимали слоты, которые могли достаться новым.
+            "dead_ttl",
+            "dead_max_entries",
             "kwargs",
         }
         actual_params = set(sig.parameters.keys())

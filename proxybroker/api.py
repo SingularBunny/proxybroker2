@@ -8,6 +8,11 @@ from pprint import pprint
 
 from .checker import Checker
 from .errors import ResolveError
+from .negative_cache import (
+    DEFAULT_MAX_ENTRIES as NEG_CACHE_MAX,
+    DEFAULT_TTL as NEG_CACHE_TTL,
+    NegativeCache,
+)
 from .pool_store import DEFAULT_TTL as DEFAULT_POOL_TTL, PoolStore
 from .providers import PROVIDERS, Provider
 from .stats import PoolStats
@@ -98,6 +103,8 @@ class Broker:
         pool_ttl=DEFAULT_POOL_TTL,
         pool_save_interval=60,
         provider_timeout=PROVIDER_TIMEOUT,
+        dead_ttl=NEG_CACHE_TTL,
+        dead_max_entries=NEG_CACHE_MAX,
         **kwargs,
     ):
         # Both were module-level constants only, so callers passing them got them
@@ -138,6 +145,11 @@ class Broker:
         # состоянии остаются косвенные строки в логе — за 17 часов их было 868,
         # и ни одна не отвечала на вопрос, где именно теряются прокси.
         self.stats = PoolStats()
+        # `unique_proxies` очищается между проходами намеренно — иначе пул
+        # перестал бы принимать переопубликованный, но живой адрес. Платой шла
+        # перепроверка тех же мёртвых адресов каждый цикл: ~3500 из 3800
+        # кандидатов за проход. Кэш срезает их, не мешая живым вернуться.
+        self._dead = NegativeCache(ttl=dead_ttl, max_entries=dead_max_entries)
         #: Кто первым принёс адрес — нужно, чтобы отнести прошедшую проверку к
         #: провайдеру. Живёт один проход, очищается вместе с `unique_proxies`.
         self._source_of = {}
@@ -653,6 +665,10 @@ class Broker:
 
     async def _handle(self, proxy, check=False, source=None):
         self.stats.note_candidate()
+        host, port = proxy[0], proxy[1]
+        if check and self._dead.is_known_dead(host, port):
+            self.stats.note_known_dead()
+            return
         try:
             proxy = await Proxy.create(
                 *proxy,
@@ -702,6 +718,8 @@ class Broker:
                 self._on_check.get_nowait()
             try:
                 self.stats.note_checked()
+                if not f.result():
+                    self._dead.remember(proxy.host, proxy.port)
                 if f.result():
                     # proxy is working and its types is equal to the requested
                     self.stats.note_passed(

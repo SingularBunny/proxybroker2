@@ -52,6 +52,7 @@ class PoolStats:
         self.checked = 0
         self.passed = 0
         self.from_store = 0
+        self.known_dead = 0
         self.passes = 0
         #: Страны прошедших проверку — показывает, откуда реально берутся прокси.
         self.countries: Counter = Counter()
@@ -115,6 +116,15 @@ class PoolStats:
             if з["yielded"] >= min_yielded and з["passed"] == 0
         )
 
+    def note_known_dead(self) -> None:
+        """Пропущен как недавно проваливший проверку.
+
+        Считается отдельно: слишком агрессивный кэш выглядит снаружи ровно как
+        «провайдеры перестали отдавать прокси», и без этой ступени отличить
+        одно от другого нечем.
+        """
+        self.known_dead += 1
+
     def note_from_store(self, count: int) -> None:
         self.from_store += count
 
@@ -135,6 +145,7 @@ class PoolStats:
             "candidates": self.candidates,
             "duplicates": self.duplicates,
             "geo_rejected": self.geo_rejected,
+            "known_dead": self.known_dead,
             "checked": self.checked,
             "passed": self.passed,
         }
@@ -180,6 +191,8 @@ class PoolStats:
         части.append(f"кандидатов {self.candidates}")
         if self.duplicates:
             части.append(f"повторов {self.duplicates}")
+        if self.known_dead:
+            части.append(f"мёртвые из кэша {self.known_dead}")
         if self.geo_rejected:
             части.append(f"не та страна {self.geo_rejected}")
         доля = self.pass_rate

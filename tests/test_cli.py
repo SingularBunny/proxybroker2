@@ -648,6 +648,11 @@ class TestCliMatchesBrokerSignature:
         ),
         "verify_timeout": "Only meaningful together with verify_url.",
         "verify_ok_statuses": "Only meaningful together with verify_url.",
+        "dead_max_entries": (
+            "Потолок записей негативного кэша. Настройка от утечки, а не от "
+            "поведения: пользователю тут нечего выбирать, а размер обязан быть "
+            "ограничен — это третья по счёту коллекция, способная расти без предела."
+        ),
         "ip_hosts": (
             "External-IP discovery endpoints. Changing them is a debugging action "
             "for a broken network, not day-to-day configuration."
