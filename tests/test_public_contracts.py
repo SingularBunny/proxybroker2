@@ -51,6 +51,11 @@ class TestBrokerPublicContract:
             # them swallowed by **kwargs and silently ignored.
             "max_concurrent_providers",
             "grab_pause",
+            # Verified proxies survive the process, so the next run starts from a
+            # short list of known-good addresses instead of re-deriving one.
+            "pool_file",
+            "pool_ttl",
+            "pool_save_interval",
             "kwargs",
         }
         actual_params = set(sig.parameters.keys())

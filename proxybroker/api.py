@@ -8,6 +8,7 @@ from pprint import pprint
 
 from .checker import Checker
 from .errors import ResolveError
+from .pool_store import DEFAULT_TTL as DEFAULT_POOL_TTL, PoolStore
 from .providers import PROVIDERS, Provider
 from .proxy import Proxy
 from .resolver import Resolver
@@ -89,6 +90,9 @@ class Broker:
         verify_ok_statuses=None,
         max_concurrent_providers=None,
         grab_pause=None,
+        pool_file=None,
+        pool_ttl=DEFAULT_POOL_TTL,
+        pool_save_interval=60,
         **kwargs,
     ):
         # Both were module-level constants only, so callers passing them got them
@@ -109,6 +113,17 @@ class Broker:
         self._verify_url = verify_url
         self._verify_timeout = verify_timeout
         self._verify_ok_statuses = verify_ok_statuses
+
+        # Verified proxies survive the process, so the next run starts from a
+        # short list of addresses known to have worked instead of re-deriving
+        # one from ~40 000 candidates. See `pool_store.py`.
+        self._pool_store = PoolStore(pool_file, ttl=pool_ttl)
+        self._pool_save_interval = pool_save_interval
+        self._pool_save_task = None
+        # Everything that passed the check this run, kept for saving. Bounded by
+        # the number of *working* proxies, which is orders of magnitude below
+        # the number of candidates — this is not the list that leaked in B12.
+        self._verified = {}
 
         self.unique_proxies = {}
         # A set, and every task removes itself when it finishes — see _track().
@@ -286,9 +301,20 @@ class Broker:
         :param str verify_url:
             (optional) URL to test each proxy against after judge validation.
             Proxies that receive a response with status >= 400 or that time out
-            are discarded.  Use this to pre-filter proxies blocked by a specific
-            site's WAF (e.g. ``"https://www.cian.ru/"``).
-            Requires ``aiohttp`` and ``aiohttp-socks`` to be installed.
+            are discarded. Requires ``aiohttp`` and ``aiohttp-socks``.
+
+            Useful against sites that reject whole IP ranges — one probe saves
+            many failed requests later.
+
+            **Counter-productive against sites that allow roughly one request
+            per fresh IP.** The probe spends that request, so the proxy enters
+            the pool already burned. Real example: a client scraping cian.ru
+            plumbed this parameter through five API clients and then disabled it
+            everywhere for exactly this reason.
+
+            There is deliberately no CLI flag for this: whether it helps depends
+            on the target site's blocking model, and a flag invites use without
+            that judgement.
         :param float verify_timeout:
             (optional) Timeout in seconds for the *verify_url* request
             (default: 10).
@@ -340,10 +366,20 @@ class Broker:
         if data:
             task = asyncio.create_task(self._load(data, check=True))
         else:
+            # Re-check what worked last time before walking the providers. These
+            # go through the normal check — they skip discovery, not validation,
+            # because a pool pre-filled with dead addresses is worse than an
+            # empty one.
+            known = self._pool_store.load(countries=countries)
+            if known:
+                warm = asyncio.create_task(self._load(known, check=True))
+                tasks.append(warm)
+                self._track(warm)
             task = asyncio.create_task(self._grab(types, check=True))
         tasks.append(task)
         self._track(*tasks)
         self._grab_task = task
+        self._start_pool_autosave()
 
         if wait:
             await self.wait_until_done()
@@ -635,8 +671,40 @@ class Broker:
 
     def _push_to_result(self, proxy):
         log.debug(f"push to result: {proxy!r}")
+        if proxy is not None and self._pool_store.enabled:
+            self._verified[(proxy.host, proxy.port)] = proxy
         self._proxies.put_nowait(proxy)
         self._update_limit()
+
+    # ------------------------------------------------------------------ #
+    # Pool persistence                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _start_pool_autosave(self):
+        """Persist the working set periodically, not only on a clean stop.
+
+        `stop()` does not run when the process is killed, and a long run that
+        ends with `kill` would otherwise throw away everything it had verified —
+        which is exactly the case persistence exists for.
+        """
+        if not self._pool_store.enabled or self._pool_save_task is not None:
+            return
+        if not self._pool_save_interval:
+            return
+
+        async def _autosave():
+            while True:
+                await asyncio.sleep(self._pool_save_interval)
+                self.save_pool()
+
+        self._pool_save_task = asyncio.create_task(_autosave())
+        self._track(self._pool_save_task)
+
+    def save_pool(self) -> int:
+        """Write the proxies verified during this run. Returns entries stored."""
+        if not self._pool_store.enabled or not self._verified:
+            return 0
+        return self._pool_store.save(list(self._verified.values()))
 
     def _update_limit(self):
         self._limit -= 1
@@ -671,6 +739,12 @@ class Broker:
 
     def _done(self):
         log.debug("called done")
+        # Persist before cancelling tasks: `_done()` is the one hook that runs on
+        # every ending — `limit` reached, `stop()`, SIGINT — whereas `stop()` is
+        # not called by the CLI at all. Saving in `stop()` alone meant a `find`
+        # run that hit its limit wrote nothing, and the autosave task was
+        # cancelled below before its first tick.
+        self.save_pool()
         while self._all_tasks:
             task = self._all_tasks.pop()
             if not task.done():

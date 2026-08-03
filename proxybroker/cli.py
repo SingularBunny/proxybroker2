@@ -13,6 +13,7 @@ if sys.platform == "win32":
 
 from . import __version__ as version
 from .api import Broker
+from .pool_store import DEFAULT_TTL as DEFAULT_POOL_TTL
 from .utils import update_geoip_db
 
 
@@ -153,6 +154,47 @@ def add_broker_args(group):
         default=3,
         dest="max_tries",
         help="The maximum number of attempts to check a proxy",
+    )
+    group.add_argument(
+        "--max-concurrent-providers",
+        type=int,
+        default=3,
+        dest="max_concurrent_providers",
+        help=(
+            "How many provider lists to fetch in parallel. Raise it when the "
+            "provider list is long and the pool fills too slowly"
+        ),
+    )
+    group.add_argument(
+        "--grab-pause",
+        type=float,
+        default=60,
+        dest="grab_pause",
+        help=(
+            "Seconds to sleep between provider passes in server/forever mode. "
+            "0 keeps scraping continuously"
+        ),
+    )
+    group.add_argument(
+        "--pool-file",
+        type=str,
+        default=None,
+        dest="pool_file",
+        help=(
+            "Persist verified proxies here and re-check them on the next start. "
+            "Skips discovery, not validation: stored entries still go through "
+            "the judges"
+        ),
+    )
+    group.add_argument(
+        "--pool-ttl",
+        type=int,
+        default=DEFAULT_POOL_TTL,
+        dest="pool_ttl",
+        help=(
+            "Seconds a stored proxy is worth re-checking. Free proxies rarely "
+            "outlive a few hours; a longer window mostly costs failed checks"
+        ),
     )
     group.add_argument(
         "--timeout",
@@ -480,6 +522,10 @@ def cli(args=sys.argv[1:]):
             providers=ns.providers,
             provider_dirs=_resolve_provider_dirs(ns),
             verify_ssl=ns.verify_ssl,
+            max_concurrent_providers=ns.max_concurrent_providers,
+            grab_pause=ns.grab_pause,
+            pool_file=ns.pool_file,
+            pool_ttl=ns.pool_ttl,
             loop=loop,
         )
 

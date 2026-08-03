@@ -621,3 +621,116 @@ class TestOutputHandling:
         text = outfile.read_text()
         assert "192.0.2.1:8080" in text
         assert "198.51.100.1:8080" in text
+
+
+class TestCliMatchesBrokerSignature:
+    """Every `Broker` parameter must be reachable from the CLI, or exempt on purpose.
+
+    `verify_url`, `verify_timeout` and `verify_ok_statuses` were added to `Broker`
+    and `Checker` in May, the README gained usage examples, and `cli.py` was not
+    touched at all. Nobody noticed for three months. A downstream author then
+    documented `--verify-url` by analogy — the flag reads exactly like the others,
+    so assuming it exists is reasonable — and the command dies with
+    `unrecognized arguments`.
+
+    Discipline does not catch that; a test does. When a parameter is deliberately
+    not exposed, it belongs in `INTENTIONALLY_NOT_IN_CLI` together with the reason,
+    so the next person finds an answer instead of an omission.
+    """
+
+    #: Parameter -> why it has no flag. Read this before adding one.
+    INTENTIONALLY_NOT_IN_CLI = {
+        "verify_url": (
+            "Whether site-level verification helps depends on the target's blocking "
+            "model: against IP-range blocks it saves requests, against sites that "
+            "allow ~one request per fresh IP it spends the only request the proxy "
+            "had. A flag invites use without that judgement — set it from code."
+        ),
+        "verify_timeout": "Only meaningful together with verify_url.",
+        "verify_ok_statuses": "Only meaningful together with verify_url.",
+        "ip_hosts": (
+            "External-IP discovery endpoints. Changing them is a debugging action "
+            "for a broken network, not day-to-day configuration."
+        ),
+        "pool_save_interval": (
+            "How often the pool is flushed to disk. A tuning knob with no right "
+            "answer for the user to pick — the default exists so that a run "
+            "killed with SIGKILL still leaves recent state behind."
+        ),
+        # Plumbing, not user-facing configuration.
+        "queue": "Injection point for embedding the broker in another app.",
+        "loop": "Injection point for tests and embedding.",
+        "stop_broker_on_sigint": "Process-level concern; the CLI always wants the default.",
+    }
+
+    def test_every_broker_parameter_is_reachable_or_exempt(self):
+        import inspect
+        import re
+
+        from proxybroker import Broker
+
+        cli_source = open("proxybroker/cli.py", encoding="utf-8").read()
+        flags = set(re.findall(r'"--([a-z0-9-]+)"', cli_source))
+
+        params = [
+            p for p in inspect.signature(Broker.__init__).parameters
+            if p not in ("self", "kwargs")
+        ]
+
+        missing = []
+        for param in params:
+            # Flags are not always the parameter name: `providers` -> `--provider`,
+            # `judges` -> `--judge`, `provider_dirs` -> `--provider-dir`.
+            dashed = param.replace("_", "-")
+            candidates = {dashed, dashed.rstrip("s"), dashed.replace("-dirs", "-dir")}
+            if candidates & flags:
+                continue
+            if param in self.INTENTIONALLY_NOT_IN_CLI:
+                continue
+            missing.append(param)
+
+        assert not missing, (
+            "Broker parameters reachable from neither a CLI flag nor the exemption "
+            f"list: {missing}. Either add a flag or record why it should not have "
+            "one in INTENTIONALLY_NOT_IN_CLI."
+        )
+
+    def test_declared_flags_actually_reach_the_broker(self):
+        """A flag that argparse accepts but nobody passes on is worse than none.
+
+        The user sets it, sees no error, and gets the default behaviour — a
+        silent failure. Grepping for the flag string proves only that it was
+        declared; this checks it is also handed to the constructor.
+        """
+        import inspect
+        import re
+
+        from proxybroker import Broker
+
+        cli_source = open("proxybroker/cli.py", encoding="utf-8").read()
+        construction = re.search(r"Broker\(\s*(.*?)\n\s*\)", cli_source, re.S)
+        assert construction, "could not locate the Broker(...) call in cli.py"
+        passed = set(re.findall(r"(\w+)=", construction.group(1)))
+
+        declared_dests = set(re.findall(r'dest="(\w+)"', cli_source))
+        broker_params = set(inspect.signature(Broker.__init__).parameters)
+
+        dropped = sorted((declared_dests & broker_params) - passed)
+        assert not dropped, (
+            f"flags declared but never passed to Broker: {dropped}. "
+            "argparse would accept them silently and the value would be ignored."
+        )
+
+    def test_exemptions_are_real_parameters(self):
+        """A stale exemption would hide a genuinely missing flag."""
+        import inspect
+
+        from proxybroker import Broker
+
+        params = set(inspect.signature(Broker.__init__).parameters)
+        stale = set(self.INTENTIONALLY_NOT_IN_CLI) - params
+        assert not stale, f"exemptions for parameters that no longer exist: {stale}"
+
+    def test_every_exemption_states_a_reason(self):
+        for param, reason in self.INTENTIONALLY_NOT_IN_CLI.items():
+            assert len(reason) > 30, f"{param}: reason too thin to be useful"
