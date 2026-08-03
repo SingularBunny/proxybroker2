@@ -10,6 +10,7 @@ from .checker import Checker
 from .errors import ResolveError
 from .pool_store import DEFAULT_TTL as DEFAULT_POOL_TTL, PoolStore
 from .providers import PROVIDERS, Provider
+from .stats import PoolStats
 from .proxy import Proxy
 from .resolver import Resolver
 from .server import Server
@@ -124,6 +125,11 @@ class Broker:
         # the number of *working* proxies, which is orders of magnitude below
         # the number of candidates — this is not the list that leaked in B12.
         self._verified = {}
+
+        # Воронка «кандидат → проверка → пул». Без неё единственным сигналом о
+        # состоянии остаются косвенные строки в логе — за 17 часов их было 868,
+        # и ни одна не отвечала на вопрос, где именно теряются прокси.
+        self.stats = PoolStats()
 
         self.unique_proxies = {}
         # A set, and every task removes itself when it finishes — see _track().
@@ -371,6 +377,7 @@ class Broker:
             # because a pool pre-filled with dead addresses is worse than an
             # empty one.
             known = self._pool_store.load(countries=countries)
+            self.stats.note_from_store(len(known))
             if known:
                 warm = asyncio.create_task(self._load(known, check=True))
                 tasks.append(warm)
@@ -600,7 +607,8 @@ class Broker:
                 if not (self._server or self._forever):
                     raise
                 log.exception(f"Grab cycle failed, retrying next pass: {exc!r}")
-            log.debug("Grab cycle is complete")
+            self.stats.note_pass_complete()
+            log.info(f"Проход завершён — {self.stats.summary(self._proxies.qsize())}")
             if self._server or self._forever:
                 log.debug(f"fall asleep for {self._grab_pause} seconds")
                 await asyncio.sleep(self._grab_pause)
@@ -614,6 +622,7 @@ class Broker:
         self._done()
 
     async def _handle(self, proxy, check=False):
+        self.stats.note_candidate()
         try:
             proxy = await Proxy.create(
                 *proxy,
@@ -638,11 +647,13 @@ class Broker:
             self.unique_proxies[(proxy.host, proxy.port)] = proxy
             return True
         else:
+            self.stats.note_duplicate()
             return False
 
     def _geo_passed(self, proxy):
         if self._countries and (proxy.geo.code not in self._countries):
             proxy.log("Location of proxy is outside the given countries list")
+            self.stats.note_geo_rejected()
             return False
         else:
             return True
@@ -653,8 +664,10 @@ class Broker:
             if not self._on_check.empty():
                 self._on_check.get_nowait()
             try:
+                self.stats.note_checked()
                 if f.result():
                     # proxy is working and its types is equal to the requested
+                    self.stats.note_passed(getattr(proxy.geo, "code", None))
                     self._push_to_result(proxy)
             except asyncio.CancelledError:
                 pass
@@ -699,6 +712,15 @@ class Broker:
 
         self._pool_save_task = asyncio.create_task(_autosave())
         self._track(self._pool_save_task)
+
+    def pool_stats(self) -> dict:
+        """Срез воронки «кандидат → проверка → пул» вместе с размером очереди.
+
+        Отдаёт словарь, а не печатает: вызывающему может понадобиться отдать
+        это в метрики, в тест или в собственный лог. Строку для лога даёт
+        `Broker.stats.summary()`.
+        """
+        return self.stats.as_dict(pool_size=self._proxies.qsize())
 
     def save_pool(self) -> int:
         """Write the proxies verified during this run. Returns entries stored."""
@@ -745,6 +767,9 @@ class Broker:
         # run that hit its limit wrote nothing, and the autosave task was
         # cancelled below before its first tick.
         self.save_pool()
+        # Итог воронки в конце — по нему видно, на какой ступени терялись
+        # прокси, без чтения всего лога.
+        log.info(f"Итог — {self.stats.summary(self._proxies.qsize())}")
         while self._all_tasks:
             task = self._all_tasks.pop()
             if not task.done():

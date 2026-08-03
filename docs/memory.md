@@ -154,3 +154,53 @@ will reject anyway spends the check budget for nothing.
 Default is six hours. Free proxies rarely outlive that, and a longer window
 mostly buys failed checks at the start of the next run. If you pay for
 residential proxies, a much longer TTL is reasonable — the entries stay valid.
+
+---
+
+# Pool statistics
+
+During the seventeen-hour run the only signal was log lines, and indirect ones:
+868 repetitions of "proxy pool exhausted". Pool size, refill rate, pass rate and
+country breakdown were all known to the broker and exposed to nobody, while
+`wait_for_proxies` could only wait on a count.
+
+`Broker.stats` now counts the funnel from candidate to ready proxy, and
+`Broker.pool_stats()` returns it as a dict.
+
+## Why the funnel, not a single number
+
+Each stage answers a different question during an incident:
+
+- `candidates` — zero means the providers broke, not the checker.
+- `duplicates` — rejected as already seen this pass.
+- `geo_rejected` — failed the country filter.
+- `checked` / `passed` — reached the check, and survived it.
+- `from_store` — arrived from the persisted pool rather than a provider.
+
+The distinction matters. Two live runs, same build, minutes apart:
+
+```
+кандидатов 219 | проверено 19, прошли 8 (42.1%) | страны US:4, RU:1, DK:1, IL:1, TH:1
+кандидатов 912 | не та страна 875 | проверено 3, прошли 3 (100.0%) | страны RU:3
+```
+
+The second is the seventeen-hour scenario in one line: 875 of 912 candidates
+dropped by the country filter, three reached the check, all three passed. The
+sources were healthy and the checker was healthy — the filter was the
+constraint. Reaching that conclusion previously took hours.
+
+A single "pool is empty" counter would have said the same thing in both cases.
+
+## Details worth keeping
+
+**`pass_rate` is `None`, not `0`, before the first check.** "Zero per cent" and
+"nothing measured yet" are different states, and confusing them sends an
+incident review after dead proxies when the check has not started.
+
+**The last pass is tracked separately from the running total.** A day of
+accumulated counters hides a degradation that started an hour ago.
+
+**Accounting must not cost the run.** The counters are plain integers on the
+single-threaded event loop — no locks, no allocation on the per-proxy path — and
+`TestИнтеграцияСБрокером::test_учёт_не_роняет_проход` asserts a pass still
+completes with them in place.
