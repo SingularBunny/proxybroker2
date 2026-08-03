@@ -280,7 +280,7 @@ class TestGrabPacing:
         broker = Broker(timeout=0.1, max_tries=1, providers=[], stop_broker_on_sigint=False)
         broker._providers = [_Boom(), _Good()]
         handled = []
-        broker._handle = lambda proxy, check=False: handled.append(proxy) or asyncio.sleep(0)
+        broker._handle = lambda proxy, check=False, source=None: handled.append(proxy) or asyncio.sleep(0)
 
         await broker._grab(types={"HTTP": None}, check=False)
         broker.stop()
@@ -306,7 +306,7 @@ class TestGrabPacing:
 
         broker = Broker(timeout=0.1, max_tries=1, providers=[], stop_broker_on_sigint=False)
         broker._providers = [_Boom()]
-        broker._handle = lambda proxy, check=False: asyncio.sleep(0)
+        broker._handle = lambda proxy, check=False, source=None: asyncio.sleep(0)
 
         with caplog.at_level(logging.WARNING, logger="proxybroker"):
             await broker._grab(types={"HTTP": None}, check=False)
@@ -338,7 +338,7 @@ class TestGrabPacing:
         broker = Broker(timeout=0.1, max_tries=1, providers=[], stop_broker_on_sigint=False)
         broker._providers = [provider]
 
-        async def _handle(proxy, check=False):
+        async def _handle(proxy, check=False, source=None):
             # Simulates the provider's own fetch landing mid-iteration.
             provider._live.add((f"10.0.0.{len(provider._live)}", "8080"))
 
@@ -368,7 +368,7 @@ class TestGrabPacing:
         broker._providers = [_Good()]
         attempts = []
 
-        async def _handle(proxy, check=False):
+        async def _handle(proxy, check=False, source=None):
             attempts.append(proxy)
             if len(attempts) == 1:
                 raise RuntimeError("bug in the pass, not in a provider")

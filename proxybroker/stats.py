@@ -55,6 +55,9 @@ class PoolStats:
         self.passes = 0
         #: Страны прошедших проверку — показывает, откуда реально берутся прокси.
         self.countries: Counter = Counter()
+        #: Вклад каждого источника: сколько отдал, сколько из этого новых
+        #: адресов и сколько в итоге прошло проверку.
+        self.providers: Dict[str, Dict[str, int]] = {}
         #: Снимок счётчиков на конец предыдущего прохода.
         self._pass_baseline: Dict[str, int] = {}
         self._last_pass: Dict[str, int] = {}
@@ -73,10 +76,44 @@ class PoolStats:
     def note_checked(self) -> None:
         self.checked += 1
 
-    def note_passed(self, country: Optional[str] = None) -> None:
+    def note_passed(
+        self, country: Optional[str] = None, source: Optional[str] = None
+    ) -> None:
         self.passed += 1
         if country:
             self.countries[country] += 1
+        if source:
+            self._provider(source)["passed"] += 1
+
+    def _provider(self, name: str) -> Dict[str, int]:
+        return self.providers.setdefault(
+            name, {"yielded": 0, "unique": 0, "passed": 0, "failures": 0, "timeouts": 0}
+        )
+
+    def note_provider(
+        self, name: str, yielded: int, *, failed: bool = False, timed_out: bool = False
+    ) -> None:
+        запись = self._provider(name)
+        запись["yielded"] += yielded
+        запись["failures"] += int(failed)
+        запись["timeouts"] += int(timed_out)
+
+    def note_provider_unique(self, name: str) -> None:
+        """Адрес, которого до этого источника в проходе не было."""
+        self._provider(name)["unique"] += 1
+
+    def useless_providers(self, min_yielded: int = 50) -> list:
+        """Источники, которые отдают адреса, но ни один не доходит до пула.
+
+        Порог нужен, чтобы не записывать в бесполезные того, кто просто ещё не
+        успел ничего отдать: «ноль из трёх» и «ноль из тысячи» — разные
+        утверждения, и первое ничего не значит.
+        """
+        return sorted(
+            имя
+            for имя, з in self.providers.items()
+            if з["yielded"] >= min_yielded and з["passed"] == 0
+        )
 
     def note_from_store(self, count: int) -> None:
         self.from_store += count
@@ -127,6 +164,7 @@ class PoolStats:
             "uptime": round(self.uptime, 1),
             "countries": dict(self.countries.most_common()),
             "last_pass": dict(self._last_pass),
+            "providers": {и: dict(з) for и, з in self.providers.items()},
         }
         if pool_size is not None:
             данные["pool_size"] = pool_size

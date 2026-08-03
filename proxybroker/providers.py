@@ -58,6 +58,19 @@ class Provider:
             # No running event loop, will be set later
             self._loop = loop
 
+    def __repr__(self):
+        """Identify the source, not the object address.
+
+        Without this the base `Provider` shows as
+        `<proxybroker.providers.Provider object at 0x7f...>` — in a failure
+        message, in the per-provider contribution table, everywhere. The whole
+        point of attributing work to a source is defeated if the source cannot
+        be told apart from the other 37.
+        """
+        имя = type(self).__name__
+        адрес = getattr(self, "domain", None) or self.url or "—"
+        return f"<{имя} {адрес}>"
+
     @property
     def proxies(self):
         """Return all found proxies.

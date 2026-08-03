@@ -147,3 +147,123 @@ class TestИнтеграцияСБрокером:
         assert broker.stats.candidates == 2
         assert broker.stats.passes == 1
         broker.stop()
+
+
+class TestВкладПровайдеров:
+    """Без атрибуции нельзя ответить, какой источник заменить.
+
+    38 провайдеров создают вид разнообразия, но большинство живёт на GitHub и
+    его CDN. Понять, кто из них реально приносит живые прокси, а кто только
+    повторяет чужое, можно лишь измерив вклад каждого.
+    """
+
+    def test_вклад_разложен_по_ступеням(self):
+        s = PoolStats()
+        s.note_provider("A", 100)
+        for _ in range(40):
+            s.note_provider_unique("A")
+        s.note_passed("RU", source="A")
+
+        вклад = s.as_dict()["providers"]["A"]
+        assert вклад == {
+            "yielded": 100, "unique": 40, "passed": 1, "failures": 0, "timeouts": 0
+        }
+
+    def test_повторы_за_другими_видны(self):
+        """Источник, отдающий только чужие адреса, бесполезен при любом объёме."""
+        s = PoolStats()
+        s.note_provider("зеркало", 500)  # ни одного note_provider_unique
+
+        assert s.as_dict()["providers"]["зеркало"]["unique"] == 0
+
+    def test_бесполезные_по_порогу(self):
+        s = PoolStats()
+        s.note_provider("много_но_мёртвые", 500)
+        s.note_provider("мало_и_рано_судить", 3)
+        s.note_provider("рабочий", 500)
+        s.note_passed(source="рабочий")
+
+        assert s.useless_providers() == ["много_но_мёртвые"]
+
+    def test_порог_защищает_от_поспешного_вывода(self):
+        """«Ноль из трёх» и «ноль из тысячи» — разные утверждения."""
+        s = PoolStats()
+        s.note_provider("новичок", 3)
+        assert s.useless_providers(min_yielded=50) == []
+
+    def test_сбои_и_таймауты_считаются_отдельно(self):
+        """Сломанный парсер и зависший сокет чинятся по-разному."""
+        s = PoolStats()
+        s.note_provider("медленный", 0, timed_out=True)
+        s.note_provider("сломанный", 0, failed=True)
+
+        assert s.providers["медленный"]["timeouts"] == 1
+        assert s.providers["медленный"]["failures"] == 0
+        assert s.providers["сломанный"]["failures"] == 1
+        assert s.providers["сломанный"]["timeouts"] == 0
+
+
+class TestБюджетПровайдера:
+    @pytest.mark.asyncio
+    async def test_зависший_источник_не_держит_проход(self):
+        """В режиме forever длина прохода задаёт скорость пополнения пула.
+
+        Один источник, повисший на мёртвом сокете, задерживал прокси всех
+        остальных за собой.
+        """
+        broker = Broker(
+            timeout=0.1, max_tries=1, providers=[],
+            stop_broker_on_sigint=False, provider_timeout=1,
+        )
+
+        class _Зависший:
+            proto = set()
+
+            def __repr__(self):
+                return "<Provider завис.test>"
+
+            async def get_proxies(self):
+                await asyncio.sleep(3600)
+
+        class _Быстрый:
+            proto = set()
+
+            async def get_proxies(self):
+                return [("127.0.0.1", "8080")]
+
+        broker._providers = [_Зависший(), _Быстрый()]
+        собрано = []
+
+        async def _handle(proxy, check=False, source=None):
+            собрано.append(proxy)
+
+        broker._handle = _handle
+
+        await asyncio.wait_for(
+            broker._grab(types={"HTTP": None}, check=False), timeout=10
+        )
+        broker.stop()
+
+        assert ("127.0.0.1", "8080") in собрано, "быстрый источник не должен ждать"
+        assert broker.stats.providers["<Provider завис.test>"]["timeouts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_атрибуция_доходит_до_статистики(self):
+        broker = Broker(timeout=0.1, max_tries=1, providers=[], stop_broker_on_sigint=False)
+
+        class _Источник:
+            proto = set()
+
+            def __repr__(self):
+                return "<Provider списки.test>"
+
+            async def get_proxies(self):
+                return [("127.0.0.1", "8080"), ("127.0.0.2", "3128")]
+
+        broker._providers = [_Источник()]
+        await broker._grab(types={"HTTP": None}, check=False)
+        broker.stop()
+
+        вклад = broker.stats.providers["<Provider списки.test>"]
+        assert вклад["yielded"] == 2
+        assert вклад["unique"] == 2

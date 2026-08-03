@@ -56,6 +56,9 @@ class TestBrokerPublicContract:
             "pool_file",
             "pool_ttl",
             "pool_save_interval",
+            # Бюджет времени на один источник: зависший провайдер задерживает
+            # пополнение пула для всех остальных.
+            "provider_timeout",
             "kwargs",
         }
         actual_params = set(sig.parameters.keys())

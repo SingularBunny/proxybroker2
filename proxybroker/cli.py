@@ -12,7 +12,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from . import __version__ as version
-from .api import Broker
+from .api import PROVIDER_TIMEOUT, Broker
 from .pool_store import DEFAULT_TTL as DEFAULT_POOL_TTL
 from .utils import update_geoip_db
 
@@ -173,6 +173,17 @@ def add_broker_args(group):
         help=(
             "Seconds to sleep between provider passes in server/forever mode. "
             "0 keeps scraping continuously"
+        ),
+    )
+    group.add_argument(
+        "--provider-timeout",
+        type=int,
+        default=PROVIDER_TIMEOUT,
+        dest="provider_timeout",
+        help=(
+            "Seconds to wait for one provider list before skipping it for this "
+            "pass. In forever mode the pass length sets how fast the pool "
+            "refills, so one hung source delays everyone else's proxies"
         ),
     )
     group.add_argument(
@@ -526,6 +537,7 @@ def cli(args=sys.argv[1:]):
             grab_pause=ns.grab_pause,
             pool_file=ns.pool_file,
             pool_ttl=ns.pool_ttl,
+            provider_timeout=ns.provider_timeout,
             loop=loop,
         )
 

@@ -27,6 +27,9 @@ GRAB_PAUSE = 180
 # The maximum number of providers that are parsed concurrently
 MAX_CONCURRENT_PROVIDERS = 3
 
+# Сколько ждать один источник, прежде чем пропустить его в этом проходе.
+PROVIDER_TIMEOUT = 60
+
 
 class Broker:
     """The Broker.
@@ -94,6 +97,7 @@ class Broker:
         pool_file=None,
         pool_ttl=DEFAULT_POOL_TTL,
         pool_save_interval=60,
+        provider_timeout=PROVIDER_TIMEOUT,
         **kwargs,
     ):
         # Both were module-level constants only, so callers passing them got them
@@ -105,6 +109,10 @@ class Broker:
             else max(1, int(max_concurrent_providers))
         )
         self._grab_pause = GRAB_PAUSE if grab_pause is None else max(0, int(grab_pause))
+        # Бюджет на один источник. В режиме `forever` длина прохода определяет
+        # скорость пополнения пула, поэтому зависший на мёртвом сокете источник
+        # задерживает прокси всех остальных.
+        self._provider_timeout = max(1, int(provider_timeout))
 
         self._loop = self._resolve_loop(loop)
         self._proxies = queue or asyncio.Queue()
@@ -130,6 +138,9 @@ class Broker:
         # состоянии остаются косвенные строки в логе — за 17 часов их было 868,
         # и ни одна не отвечала на вопрос, где именно теряются прокси.
         self.stats = PoolStats()
+        #: Кто первым принёс адрес — нужно, чтобы отнести прошедшую проверку к
+        #: провайдеру. Живёт один проход, очищается вместе с `unique_proxies`.
+        self._source_of = {}
 
         self.unique_proxies = {}
         # A set, and every task removes itself when it finishes — see _track().
@@ -554,7 +565,23 @@ class Broker:
                 # from its own concurrent page fetches — iterating it directly
                 # raised "Set changed size during iteration", which killed proxy
                 # discovery for the whole client until restart.
-                return list(await provider.get_proxies())
+                #
+                # The timeout is not decoration: in `forever` mode the pass length
+                # sets how fast the pool refills, so one source that hangs on a
+                # dead socket delays every other provider's proxies behind it.
+                proxies = list(
+                    await asyncio.wait_for(
+                        provider.get_proxies(), timeout=self._provider_timeout
+                    )
+                )
+                self.stats.note_provider(str(provider), len(proxies))
+                return provider, proxies
+            except asyncio.TimeoutError:
+                log.warning(
+                    f"{provider} exceeded {self._provider_timeout}s, skipping it"
+                )
+                self.stats.note_provider(str(provider), 0, timed_out=True)
+                return provider, []
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -570,7 +597,8 @@ class Broker:
                     log.debug(f"{provider} stopped during shutdown: {exc!r}")
                 else:
                     log.warning(f"{provider} failed, skipping it: {exc!r}")
-                return []
+                    self.stats.note_provider(str(provider), 0, failed=True)
+                return provider, []
 
         def _get_tasks(by=None):
             by = self._max_concurrent_providers if by is None else by
@@ -592,8 +620,9 @@ class Broker:
                     for task in asyncio.as_completed(tasks):
                         # `_fetch` already contained any provider-level failure and
                         # returned an empty list.
-                        for proxy in await task:
-                            await self._handle(proxy, check=check)
+                        provider, proxies = await task
+                        for proxy in proxies:
+                            await self._handle(proxy, check=check, source=str(provider))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -616,12 +645,13 @@ class Broker:
                 # Providers republish the same lists; without this the pool would
                 # keep rejecting known-dead entries and never take a fresh one.
                 self.unique_proxies.clear()
+                self._source_of.clear()
             else:
                 break
         await self._on_check.join()
         self._done()
 
-    async def _handle(self, proxy, check=False):
+    async def _handle(self, proxy, check=False, source=None):
         self.stats.note_candidate()
         try:
             proxy = await Proxy.create(
@@ -634,7 +664,14 @@ class Broker:
         except (ResolveError, ValueError):
             return
 
-        if not self._is_unique(proxy) or not self._geo_passed(proxy):
+        if not self._is_unique(proxy):
+            return
+        if source:
+            # Кто первым принёс этот адрес. Провайдер, приносящий только
+            # повторы за другими, бесполезен, и без атрибуции это не видно.
+            self._source_of[(proxy.host, proxy.port)] = source
+            self.stats.note_provider_unique(source)
+        if not self._geo_passed(proxy):
             return
 
         if check:
@@ -667,7 +704,10 @@ class Broker:
                 self.stats.note_checked()
                 if f.result():
                     # proxy is working and its types is equal to the requested
-                    self.stats.note_passed(getattr(proxy.geo, "code", None))
+                    self.stats.note_passed(
+                        getattr(proxy.geo, "code", None),
+                        source=self._source_of.get((proxy.host, proxy.port)),
+                    )
                     self._push_to_result(proxy)
             except asyncio.CancelledError:
                 pass
