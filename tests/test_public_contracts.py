@@ -44,6 +44,13 @@ class TestBrokerPublicContract:
             "stop_broker_on_sigint",
             "ip_hosts",
             "provider_dirs",
+            "verify_url",
+            "verify_timeout",
+            "verify_ok_statuses",
+            # Previously module-level constants only, so callers passing them had
+            # them swallowed by **kwargs and silently ignored.
+            "max_concurrent_providers",
+            "grab_pause",
             "kwargs",
         }
         actual_params = set(sig.parameters.keys())
@@ -75,6 +82,10 @@ class TestBrokerPublicContract:
             "strict",
             "dnsbl",
             "limit",
+            # find() only schedules tasks; `wait` blocks until they finish and
+            # `forever` keeps replenishing the queue instead of stopping after one pass.
+            "wait",
+            "forever",
             "kwargs",
         }
         actual_params = set(sig.parameters.keys()) - {"self"}

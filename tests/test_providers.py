@@ -7,7 +7,9 @@ flows through the whole providers module.
 
 import pytest
 
-from proxybroker.providers import Provider
+from unittest.mock import AsyncMock
+
+from proxybroker.providers import Provider, Spys_ru
 
 
 class TestProviderConstruction:
@@ -129,3 +131,125 @@ async def test_find_on_pages_handles_empty_url_list():
     # Should return cleanly without raising or scheduling tasks.
     await p._find_on_pages([])
     assert p.proxies == set()
+
+
+class TestMixedProtocolLists:
+    """Aggregated lists mix protocols in one file and mark each entry with a scheme.
+
+    Applying the provider's declared protocol to every entry checks most of them with
+    the wrong one, and they get discarded as dead. Real case: the proxifly RU list
+    holds 15 http, 20 socks4 and 29 socks5 addresses; registered wholesale as HTTP it
+    yielded an empty pool while 64 usable proxies sat in the source.
+    """
+
+    def _provider(self, proto=("HTTP", "CONNECT:80")):
+        from proxybroker.providers import Provider
+
+        return Provider(url="http://example.test/list.txt", proto=proto)
+
+    def test_scheme_prefix_overrides_declared_protocol(self):
+        provider = self._provider()
+        page = "socks5://1.2.3.4:1080\nsocks4://5.6.7.8:1081\nhttp://9.9.9.9:8080\n"
+        found = [("1.2.3.4", "1080"), ("5.6.7.8", "1081"), ("9.9.9.9", "8080")]
+
+        result = {(h, p): proto for h, p, proto in provider._proxies_with_schemes(page, found)}
+        assert result[("1.2.3.4", "1080")] == ("SOCKS5",)
+        assert result[("5.6.7.8", "1081")] == ("SOCKS4",)
+        assert "HTTP" in result[("9.9.9.9", "8080")]
+
+    def test_plain_list_keeps_declared_protocol(self):
+        """No schemes in the file → nothing changes, old behaviour preserved."""
+        provider = self._provider()
+        assert provider._proxies_with_schemes("1.2.3.4:1080\n", [("1.2.3.4", "1080")]) is None
+
+    def test_entries_without_scheme_fall_back(self):
+        provider = self._provider(proto=("HTTPS",))
+        page = "socks5://1.2.3.4:1080\n5.6.7.8:3128\n"
+        found = [("1.2.3.4", "1080"), ("5.6.7.8", "3128")]
+
+        result = {(h, p): proto for h, p, proto in provider._proxies_with_schemes(page, found)}
+        assert result[("1.2.3.4", "1080")] == ("SOCKS5",)
+        assert result[("5.6.7.8", "3128")] == ("HTTPS",), "unmarked entry keeps the default"
+
+    def test_scheme_matching_is_case_insensitive(self):
+        provider = self._provider()
+        result = provider._proxies_with_schemes(
+            "SOCKS5://1.2.3.4:1080\n", [("1.2.3.4", "1080")]
+        )
+        assert result[0][2] == ("SOCKS5",)
+
+    def test_ports_without_a_match_are_skipped(self):
+        provider = self._provider()
+        result = provider._proxies_with_schemes(
+            "socks5://1.2.3.4:1080\n", [("1.2.3.4", None)]
+        )
+        assert result == []
+
+
+class TestSpysRuRobustness:
+    """A scraper must degrade to "no proxies this pass", never to an exception.
+
+    `Spys_ru._pipe` did `re.findall(...)[0]` on the session id embedded in the page.
+    A block, a captcha or a redesign all produce a page without one, and the
+    provider raised `IndexError: list index out of range` on every pass. Before
+    failures started naming their provider the log just said
+    "Provider failed, skipping it: IndexError(...)", so the bug sat there run after
+    run with nothing to point at.
+    """
+
+    def _provider(self):
+        return Spys_ru(url="http://spys.one/proxies/", proto=("HTTP",))
+
+    @pytest.mark.asyncio
+    async def test_page_without_session_id_yields_nothing(self):
+        provider = self._provider()
+        provider.get = AsyncMock(return_value="<html>captcha, no session here</html>")
+        provider._find_on_pages = AsyncMock()
+
+        await provider._pipe()  # must not raise
+
+        provider._find_on_pages.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_page_yields_nothing(self):
+        provider = self._provider()
+        provider.get = AsyncMock(return_value="")
+        provider._find_on_pages = AsyncMock()
+
+        await provider._pipe()
+
+        provider._find_on_pages.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_session_id_is_still_used_when_present(self):
+        """The guard must not cost the provider its working path."""
+        provider = self._provider()
+        session = "a" * 32
+        provider.get = AsyncMock(return_value=f"<script>x='{session}'</script>")
+        provider._find_on_pages = AsyncMock()
+
+        await provider._pipe()
+
+        provider._find_on_pages.assert_called_once()
+        urls = provider._find_on_pages.call_args[0][0]
+        assert all(u["data"]["xf0"] == session for u in urls)
+
+    def test_undecodable_port_does_not_lose_the_page(self):
+        """An unknown symbol must cost one port, not every proxy on the page."""
+        provider = self._provider()
+        page = "1.2.3.4:8080\n5.6.7.8+(q1q1^z9z9)\n"
+
+        found = provider.find_proxies(page)  # must not raise KeyError
+
+        assert ("1.2.3.4", "8080") in found
+
+    def test_symbol_table_is_per_instance(self):
+        """As a class attribute it was shared by every instance and never cleared.
+
+        That let one pass's symbol table decode another pass's page, and it grew
+        for the life of the process.
+        """
+        first, second = self._provider(), self._provider()
+        first.charEqNum["x1y2"] = 7
+
+        assert "x1y2" not in second.charEqNum

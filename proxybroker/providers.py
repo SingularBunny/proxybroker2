@@ -73,10 +73,53 @@ class Provider:
         """
         return self._proxies
 
+    #: Scheme prefixes some lists put in front of each entry, mapped to the protocol
+    #: names the checker understands.
+    _SCHEME_PROTO = {
+        "socks5": ("SOCKS5",),
+        "socks4": ("SOCKS4",),
+        "https": ("HTTPS", "CONNECT:80", "CONNECT:25"),
+        "http": ("HTTP", "CONNECT:80"),
+    }
+
     @proxies.setter
     def proxies(self, new):
         new = [(host, port, self.proto) for host, port in new if port]
         self._proxies.update(new)
+
+    def _proxies_with_schemes(self, page, found):
+        """Attach per-line protocols when the source states them explicitly.
+
+        Aggregated lists routinely mix protocols in one file and mark each entry
+        with a scheme — `socks5://1.2.3.4:1080`. Applying the provider's declared
+        protocol to all of them checks most entries with the wrong one, and they are
+        discarded as dead. Observed on the proxifly RU list: 15 http, 20 socks4 and
+        29 socks5 in one file registered wholesale as HTTP, which is why a RU-only
+        pool stayed empty while 64 usable addresses were sitting in the source.
+
+        Falls back to the declared protocol for lines without a scheme.
+        """
+        scheme_of = {}
+        for match in re.finditer(
+            r"(?P<scheme>socks5|socks4|https|http)://(?P<host>[^\s:/]+):(?P<port>\d{2,5})",
+            page or "",
+            re.IGNORECASE,
+        ):
+            scheme_of[(match.group("host"), match.group("port"))] = match.group(
+                "scheme"
+            ).lower()
+
+        if not scheme_of:
+            return None  # nothing declared: caller keeps the existing behaviour
+
+        out = []
+        for host, port in found:
+            if not port:
+                continue
+            scheme = scheme_of.get((host, str(port)))
+            proto = self._SCHEME_PROTO.get(scheme) if scheme else None
+            out.append((host, port, proto or self.proto))
+        return out
 
     async def get_proxies(self):
         """Receive proxies from the provider and return them.
@@ -121,7 +164,13 @@ class Provider:
             log.error(
                 f"Error when executing find_proxies.Domain: {self.domain}; Error: {e!r}"
             )
-        self.proxies = received
+        # Honour per-entry schemes when the list declares them; otherwise fall back
+        # to the provider's declared protocol.
+        with_schemes = self._proxies_with_schemes(page, received)
+        if with_schemes is not None:
+            self._proxies.update(with_schemes)
+        else:
+            self.proxies = received
         added = len(self.proxies) - oldcount
         log.debug(f"{added}({len(received)}) proxies added(received) from {url}")
 
@@ -332,7 +381,10 @@ class Proxylist_me(Provider):
     async def _pipe(self):
         exp = r"""href\s*=\s*['"][^'"]*/?page=(\d+)['"]"""
         page = await self.get("https://proxylist.me/")
-        lastId = max([int(n) for n in re.findall(exp, page)])
+        # An unreachable site or a changed layout yields no matches, and max() on an
+        # empty sequence raises. Fall back to the first page only.
+        page_ids = [int(n) for n in re.findall(exp, page)]
+        lastId = max(page_ids, default=1)
         # range(1, lastId + 1): pages are 1-indexed on this site; the
         # previous range(lastId) requested ?page=0 (404) and never fetched
         # the actual last page. Pre-existing master bug.
@@ -380,7 +432,8 @@ class Gatherproxy_com(Provider):
             page = await self.get(url, data=data, method=method)
             if not page:
                 continue
-            lastPageId = max([int(n) for n in re.findall(expNumPages, page)])
+            # Same guard as Proxylist_me: no matches must not raise on max().
+            lastPageId = max((int(n) for n in re.findall(expNumPages, page)), default=1)
             urls = [
                 {"url": url, "data": {"Type": t, "PageIdx": pid}, "method": method}
                 for pid in range(1, lastPageId + 1)
@@ -514,7 +567,13 @@ class Proxynova_com(Provider):
 
 class Spys_ru(Provider):
     domain = "spys.ru"
-    charEqNum = {}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-instance, not per-class. As a class attribute this dict was shared by
+        # every Spys_ru object and never cleared, so it grew for the life of the
+        # process and let one pass's symbol table decode another's page.
+        self.charEqNum = {}
 
     def char_js_port_to_num(self, matchobj):
         chars = matchobj.groups()[0].split("+")
@@ -524,8 +583,18 @@ class Spys_ru(Provider):
         # => ['i9w3m3', 'k1y5'] => int^int
         num = ""
         for numOfChars in chars[1:]:  # first - is ''
-            var1, var2 = numOfChars.strip("()").split("^")
-            digit = self.charEqNum[var1] ^ self.charEqNum[var2]
+            parts = numOfChars.strip("()").split("^")
+            if len(parts) != 2:
+                # The port obfuscation scheme changed. Leaving the match as-is is
+                # better than guessing a port number.
+                return matchobj.group(0)
+            var1, var2 = parts
+            try:
+                digit = self.charEqNum[var1] ^ self.charEqNum[var2]
+            except KeyError:
+                # A symbol we never saw defined: the page is partial or the layout
+                # moved. One undecodable port must not cost the whole page.
+                return matchobj.group(0)
             num += str(digit)
         return num
 
@@ -539,8 +608,13 @@ class Spys_ru(Provider):
         for char, num in res:
             if "^" in num:
                 digit, tochar = num.split("^")
+                if tochar not in self.charEqNum:
+                    continue  # forward reference to a symbol the page never defines
                 num = int(digit) ^ self.charEqNum[tochar]
-            self.charEqNum[char] = int(num)
+            try:
+                self.charEqNum[char] = int(num)
+            except (TypeError, ValueError):
+                continue  # not a number after all — skip this symbol, keep the page
         page = re.sub(expPortOnJS, self.char_js_port_to_num, page)
         return self._find_proxies(page)
 
@@ -548,7 +622,16 @@ class Spys_ru(Provider):
         expSession = r"'([a-z0-9]{32})'"
         url = "http://spys.one/proxies/"
         page = await self.get(url)
-        sessionId = re.findall(expSession, page)[0]
+        # The proxy list is only served against a session id embedded in the page.
+        # Without it there is nothing to ask for: a blocked request, a captcha or a
+        # redesign all end up here. This used to raise `IndexError: list index out
+        # of range`, and — before failures started naming their provider — it was an
+        # anonymous error in the log that survived run after run.
+        sessions = re.findall(expSession, page)
+        if not sessions:
+            log.debug(f"{self}: no session id on the page, skipping this pass")
+            return
+        sessionId = sessions[0]
         data = {
             "xf0": sessionId,  # session id
             "xpp": 3,  # 3 - 200 proxies on page

@@ -87,8 +87,20 @@ class Broker:
         verify_url=None,
         verify_timeout=10,
         verify_ok_statuses=None,
+        max_concurrent_providers=None,
+        grab_pause=None,
         **kwargs,
     ):
+        # Both were module-level constants only, so callers passing them got them
+        # swallowed by **kwargs and silently ignored: a config asking for 500
+        # concurrent providers still scraped 3 at a time.
+        self._max_concurrent_providers = (
+            MAX_CONCURRENT_PROVIDERS
+            if max_concurrent_providers is None
+            else max(1, int(max_concurrent_providers))
+        )
+        self._grab_pause = GRAB_PAUSE if grab_pause is None else max(0, int(grab_pause))
+
         self._loop = self._resolve_loop(loop)
         self._proxies = queue or asyncio.Queue()
         self._resolver = Resolver(loop=self._loop, ip_hosts=ip_hosts)
@@ -99,12 +111,23 @@ class Broker:
         self._verify_ok_statuses = verify_ok_statuses
 
         self.unique_proxies = {}
-        self._all_tasks = []
+        # A set, and every task removes itself when it finishes — see _track().
+        #
+        # This was a plain list that only ever grew: a task was appended for every
+        # provider on every pass and for every single proxy candidate checked, while
+        # the only drain was _done(). That was survivable while a caller recreated the
+        # Broker each cycle, but in `forever` mode _done() never runs, so completed
+        # Task objects — each holding its result and coroutine frame — accumulated
+        # without limit. Observed in production: 66 GB resident after 2.5 hours, on a
+        # run that had not yet made a single request.
+        self._all_tasks = set()
         self._checker = None
         self._server = None
         self._signal_handler_registered = False
         self._limit = 0  # not limited
         self._countries = None
+        self._forever = False
+        self._grab_task = None
 
         max_conn, max_tries = self._resolve_deprecated_limits(
             max_conn=max_conn,
@@ -208,7 +231,7 @@ class Broker:
         self._countries = countries
         self._limit = limit
         task = asyncio.create_task(self._grab(check=False))
-        self._all_tasks.append(task)
+        self._track(task)
 
     async def find(
         self,
@@ -220,6 +243,8 @@ class Broker:
         strict=False,
         dnsbl=None,
         limit=0,
+        wait=False,
+        forever=False,
         **kwargs,
     ):
         """Gather and check proxies from providers or from a passed data.
@@ -249,6 +274,15 @@ class Broker:
             (optional) Spam databases for proxy checking.
             `Wiki <https://en.wikipedia.org/wiki/DNSBL>`_
         :param int limit: (optional) The maximum number of proxies
+        :param bool wait:
+            (optional) Block until grabbing finishes instead of returning as soon
+            as the tasks are scheduled. Has no meaning together with *forever*.
+        :param bool forever:
+            (optional) Keep replenishing the queue indefinitely: after every pass
+            over the providers sleep *grab_pause* seconds and start again, so the
+            consumer can just wait on the queue for a fresh proxy. Without it the
+            broker makes a single pass, then stops and pushes ``None`` into the
+            queue as an end-of-stream marker. Mutually exclusive with *limit*.
         :param str verify_url:
             (optional) URL to test each proxy against after judge validation.
             Proxies that receive a response with status >= 400 or that time out
@@ -269,6 +303,14 @@ class Broker:
             Added: :attr:`post`, :attr:`strict`, :attr:`dnsbl`.
             Changed: :attr:`types` is required.
         """
+        # Validate the call before doing any network work: these are programming
+        # errors, and finding out after a DNS round-trip only obscures them.
+        if forever and limit:
+            raise ValueError(
+                "`limit` and `forever` are mutually exclusive: reaching the limit "
+                "stops the broker and pushes the end-of-stream sentinel into the queue."
+            )
+
         ips = await self._resolver.get_real_ext_ips()
         types = _update_types(types)
 
@@ -292,6 +334,7 @@ class Broker:
         )
         self._countries = countries
         self._limit = limit
+        self._forever = forever
 
         tasks = [asyncio.create_task(self._checker.check_judges())]
         if data:
@@ -299,7 +342,28 @@ class Broker:
         else:
             task = asyncio.create_task(self._grab(types, check=True))
         tasks.append(task)
-        self._all_tasks.extend(tasks)
+        self._track(*tasks)
+        self._grab_task = task
+
+        if wait:
+            await self.wait_until_done()
+
+    async def wait_until_done(self):
+        """Wait until grabbing/checking finishes (or ``limit`` proxies are found).
+
+        ``find()`` only schedules tasks and returns, which is easy to misread as
+        "run to completion" — a caller doing ``await broker.find(...)`` and then
+        measuring the queue sees nothing yet, and dropping the Broker afterwards
+        orphans tasks that keep running. Await this to actually block.
+        """
+        task = getattr(self, "_grab_task", None)
+        if task is None:
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            # _done() cancels the grab task once `limit` is reached — expected.
+            pass
 
     def serve(self, host="127.0.0.1", port=8888, limit=100, **kwargs):
         """Start a local proxy server.
@@ -431,30 +495,83 @@ class Broker:
         self._done()
 
     async def _grab(self, types=None, check=False):
-        def _get_tasks(by=MAX_CONCURRENT_PROVIDERS):
+        async def _fetch(provider):
+            # Providers scrape third-party HTML and break all the time — a changed
+            # layout, a 502, a rate limit. One of them must never be able to abort
+            # the whole pass: that would starve the pool of every other provider's
+            # proxies too.
+            #
+            # The handling lives here rather than at the `as_completed` site
+            # because only here is the provider still in scope. Previously the log
+            # read "Provider failed: IndexError('list index out of range')" with no
+            # way to tell which of ~30 sources had the broken parser.
+            try:
+                # A snapshot, not the provider's live set. `get_proxies()` returns
+                # `Provider._proxies` itself, and the provider keeps adding to it
+                # from its own concurrent page fetches — iterating it directly
+                # raised "Set changed size during iteration", which killed proxy
+                # discovery for the whole client until restart.
+                return list(await provider.get_proxies())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Teardown noise ("Session is closed", a resolver that is already
+                # gone) says nothing about the provider — it means we are shutting
+                # down. Keep it at debug so a real provider breakage stays visible
+                # in a normal-level log.
+                text = str(exc)
+                is_teardown = isinstance(exc, (RuntimeError, AttributeError)) and (
+                    "closed" in text or "getaddrinfo" in text or "Event loop" in text
+                )
+                if is_teardown or "Connector is closed" in text:
+                    log.debug(f"{provider} stopped during shutdown: {exc!r}")
+                else:
+                    log.warning(f"{provider} failed, skipping it: {exc!r}")
+                return []
+
+        def _get_tasks(by=None):
+            by = self._max_concurrent_providers if by is None else by
             providers = [
                 pr
                 for pr in self._providers
                 if not types or not pr.proto or bool(pr.proto & types.keys())
             ]
             while providers:
-                tasks = [asyncio.create_task(pr.get_proxies()) for pr in providers[:by]]
+                tasks = [asyncio.create_task(_fetch(pr)) for pr in providers[:by]]
                 del providers[:by]
-                self._all_tasks.extend(tasks)
+                self._track(*tasks)
                 yield tasks
 
         log.debug("Start grabbing proxies")
         while True:
-            for tasks in _get_tasks():
-                for task in asyncio.as_completed(tasks):
-                    proxies = await task
-                    for proxy in proxies:
-                        await self._handle(proxy, check=check)
+            try:
+                for tasks in _get_tasks():
+                    for task in asyncio.as_completed(tasks):
+                        # `_fetch` already contained any provider-level failure and
+                        # returned an empty list.
+                        for proxy in await task:
+                            await self._handle(proxy, check=check)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A pass may still fail in a way no provider owns — a bug here, a
+                # resolver that went away. In `forever` mode that used to end
+                # discovery permanently: the exception unwound through `find()`,
+                # the caller logged it once, and the pool then sat empty for the
+                # rest of the process's life while the app logged "pool exhausted"
+                # every 30 seconds. A long-lived broker must survive its own bad
+                # pass and try again.
+                if not (self._server or self._forever):
+                    raise
+                log.exception(f"Grab cycle failed, retrying next pass: {exc!r}")
             log.debug("Grab cycle is complete")
-            if self._server:
-                log.debug(f"fall asleep for {GRAB_PAUSE} seconds")
-                await asyncio.sleep(GRAB_PAUSE)
+            if self._server or self._forever:
+                log.debug(f"fall asleep for {self._grab_pause} seconds")
+                await asyncio.sleep(self._grab_pause)
                 log.debug("awaked")
+                # Providers republish the same lists; without this the pool would
+                # keep rejecting known-dead entries and never take a fresh one.
+                self.unique_proxies.clear()
             else:
                 break
         await self._on_check.join()
@@ -514,7 +631,7 @@ class Broker:
         await self._on_check.put(None)
         task = asyncio.create_task(self._checker.check(proxy))
         task.add_done_callback(partial(_task_done, proxy))
-        self._all_tasks.append(task)
+        self._track(task)
 
     def _push_to_result(self, proxy):
         log.debug(f"push to result: {proxy!r}")
@@ -541,6 +658,16 @@ class Broker:
                 # NotImplementedError on Windows, ValueError if handler wasn't set
                 pass
         log.info("Stop!")
+
+    def _track(self, *tasks):
+        """Remember tasks so stop() can cancel them, without retaining them forever.
+
+        The done-callback is what keeps the set bounded: a finished task drops out on
+        its own, so the set holds only work that is still in flight.
+        """
+        for task in tasks:
+            self._all_tasks.add(task)
+            task.add_done_callback(self._all_tasks.discard)
 
     def _done(self):
         log.debug("called done")

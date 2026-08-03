@@ -55,6 +55,34 @@ Features
 -   **🖥️ Proxy Server Mode** - Deploy your own rotating proxy server with automatic failover
 -   **🎯 Smart Filtering** - Filter by country, protocol, anonymity level, response time
 -   **🐍 Modern Python** - Full support for Python 3.10, 3.11, 3.12, 3.13, and 3.14
+-   **♾️ Continuous discovery** - `find(forever=True)` keeps the queue topped up so a long-running consumer can just wait on the pool
+
+### Using it as a proxy pool for a long-running job
+
+`find()` schedules tasks and returns; it does not run to completion. For a process
+that needs a permanently replenished pool — a scraper that asks for a fresh proxy and
+waits — use `forever` and stop the broker on shutdown:
+
+```python
+broker = Broker(
+    queue=proxies,
+    max_concurrent_providers=50,   # default 3
+    grab_pause=60,                 # seconds between passes over the provider list
+)
+
+# Runs until cancelled: pass over providers → sleep grab_pause → repeat.
+task = asyncio.create_task(broker.find(types=["HTTPS", "SOCKS5"], forever=True, wait=True))
+...
+task.cancel()
+broker.stop()
+```
+
+Do not combine `forever` with `limit`: reaching the limit stops the broker and pushes
+a `None` end-of-stream marker into the queue, which is the opposite of what a
+long-running pool needs. The combination raises `ValueError`.
+
+Use `wait=True` (or `await broker.wait_until_done()`) when you do want to block until
+a bounded run finishes — otherwise the queue is still empty when `find()` returns.
 
 
 

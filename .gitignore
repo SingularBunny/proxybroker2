@@ -241,3 +241,6 @@ venv_*/
 # uv-managed venv lockfile. Project uses poetry.lock as the canonical
 # lockfile; committing both creates ambiguity for contributors.
 uv.lock
+
+# JetBrains
+.idea/

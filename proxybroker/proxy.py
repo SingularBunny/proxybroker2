@@ -34,9 +34,12 @@ def _format_host_port(host: str, port: int | str) -> str:
     return f"{host}:{port}"
 
 
+_UNVERIFIED_SSL_CONTEXT = None
+
+
 # nosemgrep: python.lang.security.unverified-ssl-context.unverified-ssl-context
 def _make_unverified_ssl_context_for_proxy_testing():
-    """Build an SSL context that skips cert + hostname verification.
+    """Return the shared SSL context that skips cert + hostname verification.
 
     Intentional. Proxy testing connects to whatever server the proxy is
     (often expired/self-signed/mismatched). Users who only test trusted
@@ -44,11 +47,29 @@ def _make_unverified_ssl_context_for_proxy_testing():
     standard verifying context. This helper exists so the unsafe choice
     is named, isolated, and only annotated in one place rather than
     spread across the constructor.
+
+    The context is built once and shared by every :class:`Proxy`. It carries
+    no per-proxy state — ``Proxy`` only ever reads it, handing it to
+    ``start_tls`` — and sharing one context across many connections is the
+    ordinary way the stdlib is meant to be used.
+
+    Sharing is not a micro-optimisation. ``ssl.create_default_context()``
+    loads the entire system CA bundle into a fresh OpenSSL ``X509_STORE``,
+    which costs on the order of 800 KB of *native* memory on a host with a
+    normal ``ca-certificates`` install. A broker in ``forever`` mode builds
+    tens of thousands of ``Proxy`` objects per pass, so a per-proxy context
+    grew the resident set by roughly 6 GB per minute — invisible to
+    ``tracemalloc``, because almost none of it lives on the Python heap, and
+    never returned to the OS after the objects were collected. See
+    ``docs/memory.md``.
     """
-    ctx = _ssl.create_default_context()  # NOSONAR
-    ctx.check_hostname = False  # NOSONAR
-    ctx.verify_mode = _ssl.CERT_NONE  # NOSONAR
-    return ctx  # noqa: S323  # nosec B323  # NOSONAR
+    global _UNVERIFIED_SSL_CONTEXT
+    if _UNVERIFIED_SSL_CONTEXT is None:
+        ctx = _ssl.create_default_context()  # NOSONAR
+        ctx.check_hostname = False  # NOSONAR
+        ctx.verify_mode = _ssl.CERT_NONE  # NOSONAR
+        _UNVERIFIED_SSL_CONTEXT = ctx  # noqa: S323  # nosec B323  # NOSONAR
+    return _UNVERIFIED_SSL_CONTEXT
 
 
 class Proxy:

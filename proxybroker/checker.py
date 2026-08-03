@@ -16,6 +16,7 @@ from .errors import (
 )
 from .judge import Judge, get_judges
 from .negotiators import NGTRS
+from .proxy import _make_unverified_ssl_context_for_proxy_testing
 from .resolver import Resolver
 from .utils import (
     canonicalize_ip,
@@ -199,9 +200,11 @@ class Checker:
         is_socks4 = "SOCKS4" in proxy.types
         ok_statuses = self._verify_ok_statuses
 
-        _ssl_ctx = ssl.create_default_context()
-        _ssl_ctx.check_hostname = False
-        _ssl_ctx.verify_mode = ssl.CERT_NONE
+        # Shared, not per-call: every context loads the full system CA bundle
+        # into a fresh OpenSSL store (~800 KB of native memory), and this runs
+        # once per verified proxy. Same leak as in `Proxy.__init__` — see
+        # `proxybroker.proxy._make_unverified_ssl_context_for_proxy_testing`.
+        _ssl_ctx = _make_unverified_ssl_context_for_proxy_testing()
         timeout = aiohttp.ClientTimeout(total=self._verify_timeout)
 
         try:

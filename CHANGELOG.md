@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `Broker(max_concurrent_providers=..., grab_pause=...)` — both were module-level
+  constants only (`MAX_CONCURRENT_PROVIDERS = 3`, `GRAB_PAUSE = 180`). Callers passing
+  them had the values swallowed by `**kwargs` and silently ignored, so a configuration
+  asking for 500 concurrent providers still scraped 3 at a time.
+- `find(forever=True)` — keep replenishing the queue indefinitely: after every pass
+  over the providers sleep `grab_pause` seconds and start again. Without it the
+  library made a single pass, then called `_done()`, which cancels the tasks and
+  pushes `None` into the shared queue as an end-of-stream marker; a long-running
+  consumer saw "no more proxies" while the pool was healthy. Mutually exclusive with
+  `limit`, which is validated before any network work.
+- `find(wait=True)` and `Broker.wait_until_done()` — `find()` only schedules tasks and
+  returns, which is easy to misread as "run to completion". Callers measuring the
+  queue right after `await find(...)` always saw zero, and dropping the Broker
+  afterwards orphaned its still-running tasks.
+
+### Fixed
+- A single failing provider no longer aborts the whole grab pass. Providers scrape
+  third-party HTML and break constantly; one exception used to propagate out of
+  `_grab` and stop proxy discovery entirely, leaving the pool permanently empty.
+  Failures are logged and skipped; teardown noise (`Session is closed`, a resolver
+  that is already gone) is logged at debug so real breakages stay visible.
+- `Proxylist_me` and `GatherProxy` raised `ValueError: max() iterable argument is
+  empty` when a page returned no pagination links (site down or markup changed).
+  Both now fall back to the first page.
+- `unique_proxies` is cleared between passes in `forever` mode: providers republish
+  the same lists, so without it the broker rejected every address it had already seen
+  and the pool stopped growing.
+
 ## [2.0.0b3] - 2026-05-09
 
 ### Fixed (SingularBunny fork)
