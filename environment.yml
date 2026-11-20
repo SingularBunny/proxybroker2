@@ -12,6 +12,6 @@ dependencies:
   - aiodns>=4.0.4
   - maxminddb>=3.1.1
   - attrs>=26.1.0,<27.0.0
-  - cachetools>=7.1.4
+  - cachetools>=5.5,<8
   - click>=8.4.1
   - pyyaml>=6.0.3
