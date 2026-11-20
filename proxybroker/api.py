@@ -391,7 +391,12 @@ class Broker:
         self._limit = limit
         self._forever = forever
 
-        tasks = [asyncio.create_task(self._checker.check_judges())]
+        # Awaited, not scheduled. As a background task its "Not found judges"
+        # was never retrieved: find() returned normally and a caller's retry on
+        # exception never fired, while every check failed for lack of a judge.
+        await self._checker.check_judges()
+
+        tasks = []
         if data:
             task = asyncio.create_task(self._load(data, check=True))
         else:
@@ -658,10 +663,29 @@ class Broker:
                 # keep rejecting known-dead entries and never take a fresh one.
                 self.unique_proxies.clear()
                 self._source_of.clear()
+                await self._recheck_judges()
             else:
                 break
         await self._on_check.join()
         self._done()
+
+    async def _recheck_judges(self):
+        """Between passes: bring back protocols a judge outage switched off.
+
+        Without this a judge check that failed once — a network blip at
+        startup — disabled HTTP/SOCKS checking for the broker's whole life.
+        """
+        checker = self._checker
+        if checker is None or not checker.disabled_protocols:
+            return
+        log.warning(
+            f"Checking disabled for {sorted(checker.disabled_protocols)}, rechecking judges"
+        )
+        try:
+            await checker.check_judges()
+        except RuntimeError as exc:
+            # Still no judge at all — the network is down; try after the next pass.
+            log.warning(f"Judge recheck failed: {exc}")
 
     async def _handle(self, proxy, check=False, source=None):
         self.stats.note_candidate()

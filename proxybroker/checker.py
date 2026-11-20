@@ -106,51 +106,78 @@ class Checker:
         self._req_smtp_proto = not types or bool(("CONNECT:25",) & types.keys())  # noqa
 
         self._ngtrs = {proto for proto in types or NGTRS}
+        # What was asked for, kept apart from what is currently enabled: a judge
+        # outage switches protocols off, and a recheck has to know what to switch
+        # back on.
+        self._all_judges = list(self._judges)
+        self._wanted_ngtrs = set(self._ngtrs)
+        self._want_http = self._req_http_proto
+        self._want_https = self._req_https_proto
+        self._want_smtp = self._req_smtp_proto
+
+    @property
+    def disabled_protocols(self):
+        """Requested protocols currently switched off for lack of a judge."""
+        return self._wanted_ngtrs - self._ngtrs
 
     async def check_judges(self):
-        # TODO: need refactoring
+        """Check judges and enable exactly the protocols that have one.
+
+        Safe to call again: only judges that are not working yet are dialled,
+        and protocols switched off by an earlier failure come back as soon as
+        a judge for them passes. A ``forever`` broker calls this between passes
+        while anything is disabled — a judge outage on a flaky network is
+        usually a minute long, and before this it disabled SOCKS checking for
+        the rest of the broker's life.
+        """
         log.debug("Start check judges")
         stime = time.time()
+        pending = [j for j in self._all_judges if not j.is_working]
         await asyncio.gather(
-            *[j.check(real_ext_ips=self._real_ext_ips) for j in self._judges]
+            *[j.check(real_ext_ips=self._real_ext_ips) for j in pending]
         )
 
-        self._judges = [j for j in self._judges if j.is_working]
+        self._judges = [j for j in self._all_judges if j.is_working]
         log.debug(
-            f"{len(self._judges)} judges added. Runtime: {time.time() - stime:.4f};"
+            f"{len(self._judges)} judges working. Runtime: {time.time() - stime:.4f};"
         )
 
         nojudges = []
         disable_protocols = []
 
-        if len(Judge.available["HTTP"]) == 0:
+        http_ok = bool(Judge.available["HTTP"])
+        https_ok = bool(Judge.available["HTTPS"])
+        smtp_ok = bool(Judge.available["SMTP"])
+        if not http_ok:
             nojudges.append("HTTP")
             disable_protocols.extend(["HTTP", "CONNECT:80", "SOCKS4", "SOCKS5"])
-            self._req_http_proto = False
             # for coroutines, which is already waiting
             Judge.ev["HTTP"].set()
-        if len(Judge.available["HTTPS"]) == 0:
+        if not https_ok:
             nojudges.append("HTTPS")
             disable_protocols.append("HTTPS")
-            self._req_https_proto = False
-            # for coroutines, which is already waiting
             Judge.ev["HTTPS"].set()
-        if len(Judge.available["SMTP"]) == 0:
+        if not smtp_ok:
             disable_protocols.append("SMTP")
-            self._req_smtp_proto = False
             Judge.ev["SMTP"].set()
+        self._req_http_proto = self._want_http and http_ok
+        self._req_https_proto = self._want_https and https_ok
+        self._req_smtp_proto = self._want_smtp and smtp_ok
 
-        for proto in disable_protocols:
-            if proto in self._ngtrs:
-                self._ngtrs.remove(proto)
+        was_disabled = self.disabled_protocols
+        self._ngtrs = {p for p in self._wanted_ngtrs if p not in disable_protocols}
+        if was_disabled and not self.disabled_protocols:
+            log.warning(f"Judges are back, checking re-enabled for {sorted(was_disabled)}")
 
-        if nojudges:
-            warnings.warn(
+        if nojudges and self.disabled_protocols:
+            message = (
                 f"Not found judges for the {nojudges} protocol.\n"
-                f"Checking proxy on protocols {disable_protocols} is disabled.",
-                UserWarning,
-                stacklevel=2,
+                f"Checking proxy on protocols {disable_protocols} is disabled."
             )
+            # warnings.warn alone is printed once per process; a long-lived
+            # broker needs every occurrence in its log.
+            log.warning(message.replace("\n", " "))
+            warnings.warn(message, UserWarning, stacklevel=2)
         if self._judges:
             log.debug(f"Loaded: {len(set(self._judges))} proxy judges")
         else:

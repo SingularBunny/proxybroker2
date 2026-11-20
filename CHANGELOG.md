@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the executable and publish workflows still build with 3.14.
 
 ### Fixed
+- A failed judge check no longer kills a long-running broker silently. `find()`
+  now awaits `check_judges()`, so "Not found judges" reaches the caller instead of
+  dying in an unawaited task. In `forever` mode protocols switched off by a judge
+  outage are rechecked between passes and come back with the network; each
+  occurrence is logged, not only the first `warnings.warn` per process.
 - A single failing provider no longer aborts the whole grab pass. Providers scrape
   third-party HTML and break constantly; one exception used to propagate out of
   `_grab` and stop proxy discovery entirely, leaving the pool permanently empty.
