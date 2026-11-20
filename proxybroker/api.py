@@ -407,7 +407,7 @@ class Broker:
             known = self._pool_store.load(countries=countries)
             self.stats.note_from_store(len(known))
             if known:
-                warm = asyncio.create_task(self._load(known, check=True))
+                warm = asyncio.create_task(self._load(known, check=True, finish=False))
                 tasks.append(warm)
                 self._track(warm)
             task = asyncio.create_task(self._grab(types, check=True))
@@ -533,11 +533,15 @@ class Broker:
 
         self._loop.run_until_complete(run_server())
 
-    async def _load(self, data, check=True):
+    async def _load(self, data, check=True, finish=True):
         """Looking for proxies in the passed data.
 
         Transform the passed data from [raw string | file-like object | list]
         to set {(host, port), ...}: {('192.168.0.1', '80'), }
+
+        ``finish=False`` for the warm start from the saved pool: there the
+        loaded addresses are an addition to provider discovery, not the whole
+        job, and ending the broker after them stopped discovery for good.
         """
         log.debug("Load proxies from the raw data")
         if isinstance(data, io.TextIOWrapper):
@@ -562,6 +566,8 @@ class Broker:
         proxies = set(data)
         for proxy in proxies:
             await self._handle(proxy, check=check)
+        if not finish:
+            return
         await self._on_check.join()
         self._done()
 

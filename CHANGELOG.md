@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the executable and publish workflows still build with 3.14.
 
 ### Fixed
+- Warm start from the saved pool no longer ends the broker. The loader finished
+  with `_done()`, which cancelled provider discovery and pushed `None` into the
+  queue a few seconds after start — every run after the first that saved a pool.
 - A failed judge check no longer kills a long-running broker silently. `find()`
   now awaits `check_judges()`, so "Not found judges" reaches the caller instead of
   dying in an unawaited task. In `forever` mode protocols switched off by a judge
