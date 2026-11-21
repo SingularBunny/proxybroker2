@@ -135,6 +135,7 @@ class Broker:
         # host"); one failed probe at startup should not cost a whole start.
         self._start_retries = max(1, int(start_retries))
         self._start_retry_pause = max(0.0, float(start_retry_pause))
+        self._final_start_attempt = True
 
         # Verified proxies survive the process, so the next run starts from a
         # short list of addresses known to have worked instead of re-deriving
@@ -402,7 +403,7 @@ class Broker:
         # Awaited, not scheduled. As a background task its "Not found judges"
         # was never retrieved: find() returned normally and a caller's retry on
         # exception never fired, while every check failed for lack of a judge.
-        await self._with_start_retries(self._checker.check_judges, "judges")
+        await self._with_start_retries(self._start_judges, "judges")
 
         tasks = []
         if data:
@@ -697,6 +698,7 @@ class Broker:
         lost connectivity, not a dead network.
         """
         for attempt in range(1, self._start_retries + 1):
+            self._final_start_attempt = attempt == self._start_retries
             try:
                 return await probe()
             except RuntimeError as exc:
@@ -707,6 +709,22 @@ class Broker:
                     f"in {self._start_retry_pause:.0f}s"
                 )
                 await asyncio.sleep(self._start_retry_pause)
+
+    async def _start_judges(self):
+        """Judge check at startup: a partial outage counts as a failure too.
+
+        Losing only the HTTP judges disables HTTP, SOCKS4 and SOCKS5 checking
+        without raising, so a plain retry-on-exception never fired and the
+        broker started with most free proxies uncheckable (2026-11-22: HTTP
+        judges failed 3 s after the previous step closed hundreds of sockets).
+        The last attempt accepts whatever is up; the between-pass recheck takes
+        it from there.
+        """
+        await self._checker.check_judges()
+        if self._checker.disabled_protocols and not self._final_start_attempt:
+            raise RuntimeError(
+                f"judges missing for {sorted(self._checker.disabled_protocols)}"
+            )
 
     async def _recheck_judges(self):
         """Between passes: bring back protocols a judge outage switched off.
