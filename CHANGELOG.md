@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the executable and publish workflows still build with 3.14.
 
 ### Fixed
+- Cancelling the caller of `find(wait=True)` now cancels it instead of returning
+  normally; a supervisor restarting finished `forever` brokers no longer loops on shutdown.
 - Warm start from the saved pool no longer ends the broker. The loader finished
   with `_done()`, which cancelled provider discovery and pushed `None` into the
   queue a few seconds after start — every run after the first that saved a pool.

@@ -434,7 +434,13 @@ class Broker:
             await task
         except asyncio.CancelledError:
             # _done() cancels the grab task once `limit` is reached — expected.
-            pass
+            # But if it is the *caller* being cancelled (shutdown), swallowing it
+            # made `find(wait=True)` return normally: a supervisor that restarts
+            # a finished `forever` broker then restarted it forever and the
+            # shutdown never completed.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
 
     def serve(self, host="127.0.0.1", port=8888, limit=100, **kwargs):
         """Start a local proxy server.
