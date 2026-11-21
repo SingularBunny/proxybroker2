@@ -657,6 +657,11 @@ class TestCliMatchesBrokerSignature:
             "External-IP discovery endpoints. Changing them is a debugging action "
             "for a broken network, not day-to-day configuration."
         ),
+        "start_retries": (
+            "Startup probe retries on a flaky uplink. A robustness default, not a "
+            "choice the user makes per run; embedders tune it from code."
+        ),
+        "start_retry_pause": "Only meaningful together with start_retries.",
         "pool_save_interval": (
             "How often the pool is flushed to disk. A tuning knob with no right "
             "answer for the user to pick — the default exists so that a run "

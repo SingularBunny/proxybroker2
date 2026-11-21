@@ -63,6 +63,10 @@ class TestBrokerPublicContract:
             # кандидатов занимали слоты, которые могли достаться новым.
             "dead_ttl",
             "dead_max_entries",
+            # Повтор стартовых проверок (внешний IP, судьи): связь пропадает
+            # на секунды, и один отказ не должен стоить всего старта.
+            "start_retries",
+            "start_retry_pause",
             "kwargs",
         }
         actual_params = set(sig.parameters.keys())

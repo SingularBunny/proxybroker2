@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the executable and publish workflows still build with 3.14.
 
 ### Fixed
+- Startup probes (external IP, judges) retry before giving up: `Broker(start_retries=5,
+  start_retry_pause=10)`. A few seconds of lost connectivity no longer fail a start.
 - Cancelling the caller of `find(wait=True)` now cancels it instead of returning
   normally; a supervisor restarting finished `forever` brokers no longer loops on shutdown.
 - Warm start from the saved pool no longer ends the broker. The loader finished

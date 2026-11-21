@@ -104,6 +104,8 @@ class Broker:
         pool_save_interval=60,
         provider_timeout=PROVIDER_TIMEOUT,
         dead_ttl=NEG_CACHE_TTL,
+        start_retries=5,
+        start_retry_pause=10,
         dead_max_entries=NEG_CACHE_MAX,
         **kwargs,
     ):
@@ -129,6 +131,10 @@ class Broker:
         self._verify_url = verify_url
         self._verify_timeout = verify_timeout
         self._verify_ok_statuses = verify_ok_statuses
+        # A flaky uplink drops connections for seconds at a time ("No route to
+        # host"); one failed probe at startup should not cost a whole start.
+        self._start_retries = max(1, int(start_retries))
+        self._start_retry_pause = max(0.0, float(start_retry_pause))
 
         # Verified proxies survive the process, so the next run starts from a
         # short list of addresses known to have worked instead of re-deriving
@@ -366,7 +372,9 @@ class Broker:
                 "stops the broker and pushes the end-of-stream sentinel into the queue."
             )
 
-        ips = await self._resolver.get_real_ext_ips()
+        ips = await self._with_start_retries(
+            self._resolver.get_real_ext_ips, "external IP"
+        )
         types = _update_types(types)
 
         if not types:
@@ -394,7 +402,7 @@ class Broker:
         # Awaited, not scheduled. As a background task its "Not found judges"
         # was never retrieved: find() returned normally and a caller's retry on
         # exception never fired, while every check failed for lack of a judge.
-        await self._checker.check_judges()
+        await self._with_start_retries(self._checker.check_judges, "judges")
 
         tasks = []
         if data:
@@ -680,6 +688,25 @@ class Broker:
                 break
         await self._on_check.join()
         self._done()
+
+    async def _with_start_retries(self, probe, what):
+        """Run a startup probe, retrying on ``RuntimeError`` with a pause.
+
+        ``get_real_ext_ips`` and ``check_judges`` signal "nothing answered" with
+        ``RuntimeError``; on an unstable link that is usually a few seconds of
+        lost connectivity, not a dead network.
+        """
+        for attempt in range(1, self._start_retries + 1):
+            try:
+                return await probe()
+            except RuntimeError as exc:
+                if attempt == self._start_retries:
+                    raise
+                log.warning(
+                    f"{what}: {exc}; retry {attempt}/{self._start_retries - 1} "
+                    f"in {self._start_retry_pause:.0f}s"
+                )
+                await asyncio.sleep(self._start_retry_pause)
 
     async def _recheck_judges(self):
         """Between passes: bring back protocols a judge outage switched off.
