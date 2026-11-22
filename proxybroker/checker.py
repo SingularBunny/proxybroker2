@@ -1,4 +1,5 @@
 import asyncio
+import secrets
 import ssl
 import time
 import warnings
@@ -89,7 +90,12 @@ class Checker:
         self._strict = strict
         self._dnsbl = dnsbl or []
         self._types = types or {}
-        self._verify_url = verify_url
+        # One URL or several. Several work like judges: the proxy passes when any
+        # of them answers, so one page being down does not empty the pool.
+        if isinstance(verify_url, str):
+            verify_url = [verify_url]
+        self._verify_urls = [u for u in (verify_url or []) if u]
+        self._verify_url = self._verify_urls[0] if self._verify_urls else None
         self._verify_timeout = verify_timeout
         self._verify_ok_statuses = verify_ok_statuses
         try:
@@ -211,11 +217,22 @@ class Checker:
         return False
 
     async def _verify_against_url(self, proxy) -> bool:
-        """Test proxy against *verify_url* using aiohttp.
+        """Test proxy against the verify URLs; passes if any of them answers.
 
-        Returns True if the response status is in *verify_ok_statuses*
-        (default: any status < 400).  Connection errors and timeouts return False.
+        URLs are tried in random order so the load spreads across them, and the
+        first pass ends the check. A URL passes when its status is in
+        *verify_ok_statuses* (default: any status < 400).
         """
+        urls = list(self._verify_urls)
+        while urls:
+            url = secrets.choice(urls)
+            urls.remove(url)
+            if await self._verify_one(proxy, url):
+                return True
+        return False
+
+    async def _verify_one(self, proxy, url) -> bool:
+        """Test proxy against one URL. Errors and timeouts return False."""
         try:
             import aiohttp
             from aiohttp_socks import ProxyConnector
@@ -242,14 +259,14 @@ class Checker:
                 )
                 async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                     async with session.get(
-                        self._verify_url, allow_redirects=False, ssl=_ssl_ctx
+                        url, allow_redirects=False, ssl=_ssl_ctx
                     ) as resp:
                         status = resp.status
             else:
                 # HTTP proxy
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.get(
-                        self._verify_url,
+                        url,
                         proxy=f"http://{proxy.host}:{proxy.port}",
                         allow_redirects=False,
                         ssl=_ssl_ctx,
@@ -258,12 +275,12 @@ class Checker:
 
             passed = (status < 400) if ok_statuses is None else (status in ok_statuses)
             proxy.log(
-                f"[INFO]: verify_url={self._verify_url} status={status} "
+                f"[INFO]: verify_url={url} status={status} "
                 f"({'OK' if passed else 'BLOCKED'})"
             )
             return passed
         except Exception as e:
-            proxy.log(f"[INFO]: verify_url={self._verify_url} error: {e}")
+            proxy.log(f"[INFO]: verify_url={url} error: {e}")
             return False
 
     async def check(self, proxy):

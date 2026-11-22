@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `verify_url` accepts a list: like judges, the proxy passes when any URL answers,
+  so one page being down does not empty the pool.
 - `Broker(max_concurrent_providers=..., grab_pause=...)` — both were module-level
   constants only (`MAX_CONCURRENT_PROVIDERS = 3`, `GRAB_PAUSE = 180`). Callers passing
   them had the values swallowed by `**kwargs` and silently ignored, so a configuration
